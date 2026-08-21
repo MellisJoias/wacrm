@@ -1,3 +1,5 @@
+Last login: Fri Aug 21 16:21:03 on ttys004
+joaomelare@Mac wacrm % sed -n '1,240p' src/app/layout.tsx
 import type { Metadata, Viewport } from "next";
 import { NextIntlClientProvider } from 'next-intl';
 import { getLocale, getMessages } from 'next-intl/server';
@@ -118,3 +120,4 @@ export default async function RootLayout({
     </html>
   );
 }
+joaomelare@Mac wacrm % 

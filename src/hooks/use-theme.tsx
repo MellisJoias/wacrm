@@ -49,30 +49,62 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 function readInitialTheme(): ThemeId {
   if (typeof window === "undefined") return DEFAULT_THEME;
-  // Whatever the boot script applied is the truth. Fall back to
-  // localStorage / default if for some reason the attribute is missing
-  // (e.g. someone bypassed the boot script in a custom layout).
-  const fromAttr = document.documentElement.dataset.theme;
-  if (isThemeId(fromAttr)) return fromAttr;
+
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (isThemeId(stored)) return stored;
+
+    // Migração única do tema antigo "violet" para "emerald".
+    if (stored === "violet") {
+      localStorage.setItem(STORAGE_KEY, "emerald");
+      document.documentElement.dataset.theme = "emerald";
+      return "emerald";
+    }
+
+    // Se existir um tema válido salvo, respeita a escolha do usuário.
+    if (isThemeId(stored)) {
+      return stored;
+    }
   } catch {
-    // localStorage can throw in private-browsing / sandboxed contexts.
+    // localStorage pode falhar em private-browsing / sandboxed contexts.
   }
+
+  // Compatibilidade com o atributo aplicado pelo boot script.
+  const fromAttr = document.documentElement.dataset.theme;
+
+  // Migração do atributo antigo "violet".
+  if (fromAttr === "violet") {
+    try {
+      localStorage.setItem(STORAGE_KEY, "emerald");
+    } catch {
+      // Mantém o funcionamento em memória mesmo se localStorage falhar.
+    }
+
+    document.documentElement.dataset.theme = "emerald";
+    return "emerald";
+  }
+
+  if (isThemeId(fromAttr)) {
+    return fromAttr;
+  }
+
   return DEFAULT_THEME;
 }
 
 function readInitialMode(): Mode {
   if (typeof window === "undefined") return DEFAULT_MODE;
+
   const fromAttr = document.documentElement.dataset.mode;
+
   if (isMode(fromAttr)) return fromAttr;
+
   try {
     const stored = localStorage.getItem(MODE_STORAGE_KEY);
+
     if (isMode(stored)) return stored;
   } catch {
     // localStorage can throw in private-browsing / sandboxed contexts.
   }
+
   return DEFAULT_MODE;
 }
 
@@ -82,9 +114,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((next: ThemeId) => {
     setThemeState(next);
+
     if (typeof document !== "undefined") {
       document.documentElement.dataset.theme = next;
     }
+
     try {
       localStorage.setItem(STORAGE_KEY, next);
     } catch {
@@ -95,9 +129,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setMode = useCallback((next: Mode) => {
     setModeState(next);
+
     if (typeof document !== "undefined") {
       document.documentElement.dataset.mode = next;
     }
+
     try {
       localStorage.setItem(MODE_STORAGE_KEY, next);
     } catch {
@@ -118,8 +154,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
           setThemeState(e.newValue);
           document.documentElement.dataset.theme = e.newValue;
         }
+
         return;
       }
+
       if (e.key === MODE_STORAGE_KEY) {
         if (isMode(e.newValue) && e.newValue !== mode) {
           setModeState(e.newValue);
@@ -127,12 +165,22 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         }
       }
     }
+
     window.addEventListener("storage", onStorage);
+
     return () => window.removeEventListener("storage", onStorage);
   }, [theme, mode]);
 
   return (
-    <ThemeContext.Provider value={{ theme, setTheme, mode, setMode, toggleMode }}>
+    <ThemeContext.Provider
+      value={{
+        theme,
+        setTheme,
+        mode,
+        setMode,
+        toggleMode,
+      }}
+    >
       {children}
     </ThemeContext.Provider>
   );
@@ -140,6 +188,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
 export function useTheme(): ThemeContextValue {
   const ctx = useContext(ThemeContext);
+
   if (!ctx) {
     // Fallback for components rendered outside the provider — return
     // no-op setters so callers don't crash. The boot script still
@@ -152,5 +201,6 @@ export function useTheme(): ThemeContextValue {
       toggleMode: () => {},
     };
   }
+
   return ctx;
 }

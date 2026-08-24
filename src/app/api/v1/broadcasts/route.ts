@@ -22,30 +22,9 @@
 //               "total_recipients", "accepted", "rejected" } }
 // ============================================================
 
-import { after } from 'next/server'
+import { after } from 'next/server';
 
-import { requireApiKey } from '@/lib/auth/api-context'
-
-import {
-  ok,
-  fail,
-  toApiErrorResponse,
-} from '@/lib/api/v1/respond'
-
-import {
-  resolveAuditUserId,
-  ContactError,
-} from '@/lib/api/v1/contacts'
-
-import {
-  createBroadcast,
-  deliverBroadcast,
-  BroadcastError,
-} from '@/lib/whatsapp/broadcast-core'
-
-import {
-  createServiceRoleClient,
-} from '@/lib/supabase/server'
+import { requireApiKey } from '@/lib/auth/api-context';
 
 // The `after()` fan-out below sends to every recipient sequentially and
 // runs within this route's max duration (the same constraint the
@@ -55,192 +34,72 @@ import {
 // bound, not a guarantee: a near-cap (MAX_RECIPIENTS) audience can
 // still exceed 60s, so very large sends should be split across
 // requests. A durable queue/cron drain is the complete fix (follow-up).
-export const maxDuration = 60
+export const maxDuration = 60;
+import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
+import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';
+import {
+  createBroadcast,
+  deliverBroadcast,
+  BroadcastError,
+} from '@/lib/whatsapp/broadcast-core';
 
 export async function POST(request: Request) {
   try {
-    /**
-     * ------------------------------------------------------------
-     * 1. Authenticate the API request
-     * ------------------------------------------------------------
-     *
-     * This remains request-scoped and continues using the existing
-     * authenticated Supabase client.
-     *
-     * We do NOT replace this with service_role because the API key
-     * authorization must continue to happen normally.
-     */
-    const ctx =
-      await requireApiKey(
-        request,
-        'broadcasts:send'
-      )
+    const ctx = await requireApiKey(request, 'broadcasts:send');
 
-    const body =
-      (await request
-        .json()
-        .catch(() => null)) as Record<
-        string,
-        unknown
-      > | null
-
-    if (
-      !body ||
-      typeof body !== 'object'
-    ) {
-      return fail(
-        'bad_request',
-        'Request body must be a JSON object',
-        400
-      )
+    const body = (await request.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null;
+    if (!body || typeof body !== 'object') {
+      return fail('bad_request', 'Request body must be a JSON object', 400);
     }
 
     const templateName =
-      typeof body.template_name === 'string'
-        ? body.template_name
-        : ''
+      typeof body.template_name === 'string' ? body.template_name : '';
+    const recipients = Array.isArray(body.recipients) ? body.recipients : [];
 
-    const recipients =
-      Array.isArray(body.recipients)
-        ? body.recipients
-        : []
+    const auditUserId = await resolveAuditUserId(ctx.supabase, ctx.accountId);
 
-    /**
-     * ------------------------------------------------------------
-     * 2. Resolve audit user using the authenticated context
-     * ------------------------------------------------------------
-     */
-    const auditUserId =
-      await resolveAuditUserId(
-        ctx.supabase,
-        ctx.accountId
-      )
+    const plan = await createBroadcast(ctx.supabase, ctx.accountId, auditUserId, {
+      name: typeof body.name === 'string' ? body.name : null,
+      templateName,
+      templateLanguage:
+        typeof body.template_language === 'string'
+          ? body.template_language
+          : null,
+      recipients: recipients.map((r) => ({
+        to: typeof r?.to === 'string' ? r.to : '',
+        params: Array.isArray(r?.params) ? r.params : undefined,
+      })),
+    });
 
-    /**
-     * ------------------------------------------------------------
-     * 3. Create the Broadcast using the authenticated client
-     * ------------------------------------------------------------
-     *
-     * This preserves the existing authorization/RLS behavior
-     * during creation.
-     */
-    const plan =
-      await createBroadcast(
-        ctx.supabase,
-        ctx.accountId,
-        auditUserId,
-        {
-          name:
-            typeof body.name === 'string'
-              ? body.name
-              : null,
-
-          templateName,
-
-          templateLanguage:
-            typeof body.template_language ===
-            'string'
-              ? body.template_language
-              : null,
-
-          recipients:
-            recipients.map((r) => ({
-              to:
-                typeof r?.to === 'string'
-                  ? r.to
-                  : '',
-
-              params:
-                Array.isArray(r?.params)
-                  ? r.params
-                  : undefined,
-            })),
-        }
-      )
-
-    /**
-     * ------------------------------------------------------------
-     * 4. Create a privileged server-only client
-     * ------------------------------------------------------------
-     *
-     * IMPORTANT:
-     *
-     * ctx.supabase uses the authenticated user's session and is
-     * therefore subject to RLS.
-     *
-     * deliverBroadcast() runs after the request and performs
-     * server-side persistence of messages/conversations.
-     *
-     * Those writes must use the service-role client.
-     */
-    const serviceRoleDb =
-      createServiceRoleClient()
-
-    /**
-     * ------------------------------------------------------------
-     * 5. Fan out after the response is sent
-     * ------------------------------------------------------------
-     *
-     * Meta sending and local persistence now use the privileged
-     * server-only Supabase client.
-     *
-     * This is what allows:
-     *
-     *   messages.insert()
-     *   conversations.update()
-     *   broadcast_recipients.update()
-     *
-     * to execute without being rejected by RLS.
-     */
-    after(() =>
-      deliverBroadcast(
-        serviceRoleDb,
-        plan
-      )
-    )
+    // Fan out after the response is sent. Uses the same service-role
+    // client — no request-scoped auth needed for the Meta calls or
+    // the account-scoped row updates.
+    after(() => deliverBroadcast(ctx.supabase, plan));
 
     return ok(
       {
-        broadcast_id:
-          plan.broadcastId,
-
-        status:
-          'sending',
-
-        total_recipients:
-          plan.planned.length,
-
-        accepted:
-          plan.planned.length,
-
-        rejected:
-          plan.rejected,
+        broadcast_id: plan.broadcastId,
+        status: 'sending',
+        total_recipients: plan.planned.length,
+        accepted: plan.planned.length,
+        rejected: plan.rejected,
       },
       202
-    )
+    );
   } catch (err) {
-    if (
-      err instanceof BroadcastError
-    ) {
+    if (err instanceof BroadcastError) {
+      return fail(err.code, err.message, err.status);
+    }
+    if (err instanceof ContactError) {
       return fail(
-        err.code,
+        err.status === 400 ? 'bad_request' : 'internal',
         err.message,
         err.status
-      )
+      );
     }
-
-    if (
-      err instanceof ContactError
-    ) {
-      return fail(
-        err.status === 400
-          ? 'bad_request'
-          : 'internal',
-        err.message,
-        err.status
-      )
-    }
-
-    return toApiErrorResponse(err)
+    return toApiErrorResponse(err);
   }
 }

@@ -65,7 +65,7 @@ export class BroadcastError extends Error {
   constructor(
     code: string,
     message: string,
-    status: number
+    status: number,
   ) {
     super(message);
     this.name = 'BroadcastError';
@@ -175,7 +175,7 @@ export async function createBroadcast(
   db: SupabaseClient,
   accountId: string,
   auditUserId: string,
-  params: CreateBroadcastParams
+  params: CreateBroadcastParams,
 ): Promise<BroadcastPlan> {
   const {
     name,
@@ -192,7 +192,7 @@ export async function createBroadcast(
     throw new BroadcastError(
       'bad_request',
       "'template_name' is required",
-      400
+      400,
     );
   }
 
@@ -203,7 +203,7 @@ export async function createBroadcast(
     throw new BroadcastError(
       'bad_request',
       "'recipients' must be a non-empty array of { to, params? }",
-      400
+      400,
     );
   }
 
@@ -211,7 +211,7 @@ export async function createBroadcast(
     throw new BroadcastError(
       'bad_request',
       `A broadcast is capped at ${MAX_RECIPIENTS} recipients per request; split larger sends`,
-      400
+      400,
     );
   }
 
@@ -232,12 +232,12 @@ export async function createBroadcast(
     throw new BroadcastError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
-      400
+      400,
     );
   }
 
   const accessToken = decrypt(
-    config.access_token
+    config.access_token,
   );
 
   // ------------------------------------------------------------
@@ -249,14 +249,14 @@ export async function createBroadcast(
       db,
       accountId,
       templateName,
-      params.templateLanguage
+      params.templateLanguage,
     );
 
   if (resolvedTemplate.malformed) {
     throw new BroadcastError(
       'template_malformed',
       'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
-      500
+      500,
     );
   }
 
@@ -301,7 +301,7 @@ export async function createBroadcast(
       sanitizePhoneForMeta(
         typeof recipient.to === 'string'
           ? recipient.to
-          : ''
+          : '',
       );
 
     if (!isValidE164(sanitized)) {
@@ -316,20 +316,20 @@ export async function createBroadcast(
         auditUserId,
         {
           phone: sanitized,
-        }
+        },
       );
 
     resolved.push({
       contactId: id,
       phone: sanitized,
       params: Array.isArray(
-        recipient.params
+        recipient.params,
       )
         ? recipient.params.filter(
             (
-              value
+              value,
             ): value is string =>
-              typeof value === 'string'
+              typeof value === 'string',
           )
         : [],
     });
@@ -357,25 +357,25 @@ export async function createBroadcast(
       (recipient) => {
         if (
           seenContact.has(
-            recipient.contactId
+            recipient.contactId,
           )
         ) {
           return false;
         }
 
         seenContact.add(
-          recipient.contactId
+          recipient.contactId,
         );
 
         return true;
-      }
+      },
     );
 
   if (deduped.length === 0) {
     throw new BroadcastError(
       'bad_request',
       'No recipients had a valid E.164 phone number',
-      400
+      400,
     );
   }
 
@@ -438,18 +438,18 @@ export async function createBroadcast(
       p_contact_ids:
         deduped.map(
           (recipient) =>
-            recipient.contactId
+            recipient.contactId,
         ),
 
       p_template_params:
         deduped.map(
           (recipient) =>
-            recipient.params
+            recipient.params,
         ),
 
       p_header_media_url:
         effectiveHeaderMediaUrl,
-    }
+    },
   );
 
   if (
@@ -459,13 +459,13 @@ export async function createBroadcast(
   ) {
     console.error(
       '[broadcast-core] create broadcast error:',
-      createErr
+      createErr,
     );
 
     throw new BroadcastError(
       'internal',
       'Failed to create broadcast',
-      500
+      500,
     );
   }
 
@@ -483,8 +483,8 @@ export async function createBroadcast(
         (recipient) => [
           recipient.contactId,
           recipient,
-        ]
-      )
+        ],
+      ),
     );
 
   const planned: PlannedRecipient[] =
@@ -495,14 +495,14 @@ export async function createBroadcast(
       }) => {
         const recipient =
           byContact.get(
-            row.contact_id
+            row.contact_id,
           );
 
         if (!recipient) {
           throw new BroadcastError(
             'internal',
             'Broadcast recipient could not be mapped to its contact',
-            500
+            500,
           );
         }
 
@@ -519,7 +519,7 @@ export async function createBroadcast(
           params:
             recipient.params,
         };
-      }
+      },
     );
 
   return {
@@ -575,7 +575,7 @@ async function persistBroadcastMessage(
   db: SupabaseClient,
   plan: BroadcastPlan,
   recipient: PlannedRecipient,
-  whatsappMessageId: string
+  whatsappMessageId: string,
 ): Promise<void> {
   // ------------------------------------------------------------
   // Render the actual text using the frozen recipient parameters
@@ -584,7 +584,7 @@ async function persistBroadcastMessage(
   const renderedText =
     templateContentText(
       plan.templateRow,
-      recipient.params
+      recipient.params,
     ) ?? '';
 
   // ------------------------------------------------------------
@@ -595,7 +595,7 @@ async function persistBroadcastMessage(
     await resolveConversationByPhone(
       db,
       plan.accountId,
-      recipient.phone
+      recipient.phone,
     );
 
   // ------------------------------------------------------------
@@ -612,7 +612,7 @@ async function persistBroadcastMessage(
     })
     .eq(
       'id',
-      recipient.recipientRowId
+      recipient.recipientRowId,
     );
 
   if (recipientTextError) {
@@ -634,7 +634,7 @@ async function persistBroadcastMessage(
 
         error:
           recipientTextError,
-      }
+      },
     );
   }
 
@@ -700,7 +700,7 @@ async function persistBroadcastMessage(
 
         error:
           messageError,
-      }
+      },
     );
 
     return;
@@ -726,11 +726,11 @@ async function persistBroadcastMessage(
     })
     .eq(
       'id',
-      resolved.conversationId
+      resolved.conversationId,
     )
     .eq(
       'account_id',
-      plan.accountId
+      plan.accountId,
     );
 
   if (conversationError) {
@@ -754,7 +754,7 @@ async function persistBroadcastMessage(
 
         error:
           conversationError,
-      }
+      },
     );
   }
 }
@@ -770,12 +770,12 @@ async function persistBroadcastMessage(
  */
 export async function deliverBroadcast(
   db: SupabaseClient,
-  plan: BroadcastPlan
+  plan: BroadcastPlan,
 ): Promise<void> {
   for (const recipient of plan.planned) {
     const variants =
       phoneVariants(
-        recipient.phone
+        recipient.phone,
       );
 
     let sentMessageId:
@@ -851,7 +851,7 @@ export async function deliverBroadcast(
          */
         if (
           !isRecipientNotAllowedError(
-            message
+            message,
           )
         ) {
           break;
@@ -875,7 +875,7 @@ export async function deliverBroadcast(
           recipientUpdateError,
       } = await db
         .from(
-          'broadcast_recipients'
+          'broadcast_recipients',
         )
         .update({
           status:
@@ -892,7 +892,7 @@ export async function deliverBroadcast(
         })
         .eq(
           'id',
-          recipient.recipientRowId
+          recipient.recipientRowId,
         );
 
       if (
@@ -912,7 +912,7 @@ export async function deliverBroadcast(
 
             error:
               recipientUpdateError,
-          }
+          },
         );
       }
 
@@ -932,7 +932,7 @@ export async function deliverBroadcast(
         db,
         plan,
         recipient,
-        sentMessageId
+        sentMessageId,
       );
     } else {
       // --------------------------------------------------------
@@ -944,7 +944,7 @@ export async function deliverBroadcast(
           recipientUpdateError,
       } = await db
         .from(
-          'broadcast_recipients'
+          'broadcast_recipients',
         )
         .update({
           status:
@@ -956,7 +956,7 @@ export async function deliverBroadcast(
         })
         .eq(
           'id',
-          recipient.recipientRowId
+          recipient.recipientRowId,
         );
 
       if (
@@ -973,7 +973,7 @@ export async function deliverBroadcast(
 
             error:
               recipientUpdateError,
-          }
+          },
         );
       }
     }
@@ -991,7 +991,7 @@ export async function deliverBroadcast(
    */
   await finalizeBroadcastStatus(
     db,
-    plan.broadcastId
+    plan.broadcastId,
   );
 }
 
@@ -1004,16 +1004,16 @@ export async function deliverBroadcast(
  */
 export async function finalizeBroadcastStatus(
   db: SupabaseClient,
-  broadcastId: string
+  broadcastId: string,
 ): Promise<void> {
   const countWhere =
     async (
-      status: string
+      status: string,
     ): Promise<number> => {
       const { count } =
         await db
           .from(
-            'broadcast_recipients'
+            'broadcast_recipients',
           )
           .select('id', {
             count: 'exact',
@@ -1021,11 +1021,11 @@ export async function finalizeBroadcastStatus(
           })
           .eq(
             'broadcast_id',
-            broadcastId
+            broadcastId,
           )
           .eq(
             'status',
-            status
+            status,
           );
 
       return count ?? 0;
@@ -1037,7 +1037,7 @@ export async function finalizeBroadcastStatus(
 
   if (
     (await countWhere(
-      'pending'
+      'pending',
     )) > 0
   ) {
     /**
@@ -1054,7 +1054,7 @@ export async function finalizeBroadcastStatus(
 
   const failed =
     await countWhere(
-      'failed'
+      'failed',
     );
 
   // ------------------------------------------------------------
@@ -1065,7 +1065,7 @@ export async function finalizeBroadcastStatus(
     count: total,
   } = await db
     .from(
-      'broadcast_recipients'
+      'broadcast_recipients',
     )
     .select('id', {
       count: 'exact',
@@ -1073,7 +1073,7 @@ export async function finalizeBroadcastStatus(
     })
     .eq(
       'broadcast_id',
-      broadcastId
+      broadcastId,
     );
 
   /**
@@ -1099,6 +1099,6 @@ export async function finalizeBroadcastStatus(
     })
     .eq(
       'id',
-      broadcastId
+      broadcastId,
     );
 }

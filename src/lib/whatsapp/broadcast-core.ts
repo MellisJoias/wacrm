@@ -1,40 +1,72 @@
 // ============================================================
 // Public-API broadcast core.
 //
-// Splits a broadcast into two phases so the HTTP route can persist +
-// acknowledge fast and fan out afterwards (in `after()`):
+// Broadcasts are split into two phases:
 //
-//   createBroadcast()  — validate, resolve contacts, insert the
-//                        `broadcasts` row + `broadcast_recipients`
-//                        rows (status 'pending'), return a plan.
-//   deliverBroadcast() — send each recipient's template via Meta
-//                        (phone-variant retry), stamp each recipient
-//                        row + the aggregate counts, finalize status.
+//   createBroadcast()
+//     - validates the request
+//     - resolves/creates contacts
+//     - deduplicates recipients
+//     - atomically persists the broadcast + recipients
+//     - freezes per-recipient template params
+//     - persists campaign header media URL
+//     - returns a delivery plan
 //
-// Recipient rows carry `whatsapp_message_id`, so the inbound webhook's
-// status handler (which matches on that column) updates delivered/read
-// for API broadcasts exactly as it does for dashboard ones.
+//   deliverBroadcast()
+//     - sends each recipient through Meta
+//     - retries phone variants when appropriate
+//     - persists the Meta message in the canonical conversation
+//     - stores the WAMID on broadcast_recipients
+//     - stores the rendered template text on broadcast_recipients
+//     - finalizes the broadcast status
+//
+// The browser does NOT send WhatsApp messages directly.
+// The route creates the plan and schedules delivery through after().
+//
+// Conversation identity:
+//   account_id + contact_id
+//
+// Every successful Meta send is persisted into the SAME canonical
+// conversation used by normal dashboard/inbound messaging.
+//
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
 import { decrypt } from '@/lib/whatsapp/encryption';
+
 import {
   sanitizePhoneForMeta,
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils';
-import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
+
+import {
+  resolveTemplateRow,
+  templateContentText,
+} from '@/lib/whatsapp/template-body';
+
 import type { MessageTemplate } from '@/types';
+
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
-/** Thrown by createBroadcast on a caller-visible failure; route maps it. */
+import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation';
+
+/**
+ * Thrown by createBroadcast on a caller-visible failure.
+ * The API route maps this into the public API error envelope.
+ */
 export class BroadcastError extends Error {
   readonly code: string;
   readonly status: number;
-  constructor(code: string, message: string, status: number) {
+
+  constructor(
+    code: string,
+    message: string,
+    status: number
+  ) {
     super(message);
     this.name = 'BroadcastError';
     this.code = code;
@@ -42,45 +74,102 @@ export class BroadcastError extends Error {
   }
 }
 
+/**
+ * Recipient received by the public broadcast API.
+ *
+ * `to` is the destination phone.
+ *
+ * `params` contains the positional body variables:
+ *
+ *   {{1}}, {{2}}, {{3}}, ...
+ */
 export interface BroadcastRecipientInput {
-  /** E.164 phone. */
   to: string;
-  /** Positional body params for the template ({{1}}, {{2}}…). */
   params?: string[];
 }
 
+/**
+ * Parameters required to create a broadcast.
+ */
 export interface CreateBroadcastParams {
   name?: string | null;
+
   templateName: string;
+
   templateLanguage?: string | null;
+
   recipients: BroadcastRecipientInput[];
+
+  /**
+   * Optional campaign-level media URL used by image/video/document
+   * template headers.
+   *
+   * This is persisted on broadcasts.header_media_url so delivery
+   * and resume can reconstruct the exact campaign later.
+   */
+  headerMediaUrl?: string | null;
 }
 
 interface PlannedRecipient {
   recipientRowId: string;
+  contactId: string;
   phone: string;
   params: string[];
 }
 
+/**
+ * Everything required by deliverBroadcast().
+ *
+ * The plan is intentionally self-contained because delivery happens
+ * asynchronously in after().
+ */
 export interface BroadcastPlan {
   broadcastId: string;
+
+  accountId: string;
+
+  auditUserId: string;
+
   templateName: string;
+
   templateLanguage: string;
+
   phoneNumberId: string;
+
   accessToken: string;
+
   templateRow: MessageTemplate | null;
+
+  /**
+   * Campaign-level header media URL.
+   *
+   * Used for image/video/document template headers.
+   *
+   * Optional for backwards compatibility with existing callers/tests
+   * that construct BroadcastPlan objects manually.
+   */
+  headerMediaUrl?: string | null;
+
   planned: PlannedRecipient[];
-  /** Phones rejected up front (invalid E.164) — counted as failed. */
+
+  /**
+   * Phones rejected before recipient rows were created.
+   *
+   * These are invalid E.164 numbers.
+   */
   rejected: number;
 }
 
 const MAX_RECIPIENTS = 1000;
 
 /**
- * Validate + persist a broadcast, resolving each recipient to a
- * contact. Returns a plan for {@link deliverBroadcast}. Throws
- * {@link BroadcastError} on bad input / missing config / a malformed
- * template / a DB failure — nothing is sent in this phase.
+ * Validate and persist a broadcast.
+ *
+ * IMPORTANT:
+ * Nothing is sent to Meta in this phase.
+ *
+ * The function only prepares the delivery plan and atomically persists
+ * the campaign and recipient rows.
  */
 export async function createBroadcast(
   db: SupabaseClient,
@@ -88,18 +177,36 @@ export async function createBroadcast(
   auditUserId: string,
   params: CreateBroadcastParams
 ): Promise<BroadcastPlan> {
-  const { name, templateName, recipients } = params;
+  const {
+    name,
+    templateName,
+    recipients,
+    headerMediaUrl,
+  } = params;
+
+  // ------------------------------------------------------------
+  // Basic validation
+  // ------------------------------------------------------------
 
   if (!templateName) {
-    throw new BroadcastError('bad_request', "'template_name' is required", 400);
+    throw new BroadcastError(
+      'bad_request',
+      "'template_name' is required",
+      400
+    );
   }
-  if (!Array.isArray(recipients) || recipients.length === 0) {
+
+  if (
+    !Array.isArray(recipients) ||
+    recipients.length === 0
+  ) {
     throw new BroadcastError(
       'bad_request',
       "'recipients' must be a non-empty array of { to, params? }",
       400
     );
   }
+
   if (recipients.length > MAX_RECIPIENTS) {
     throw new BroadcastError(
       'bad_request',
@@ -108,13 +215,19 @@ export async function createBroadcast(
     );
   }
 
-  // Config (fail fast + provides the audit trail owner already resolved
-  // by the caller). Meta send needs phone_number_id + decrypted token.
-  const { data: config, error: configError } = await db
+  // ------------------------------------------------------------
+  // WhatsApp configuration
+  // ------------------------------------------------------------
+
+  const {
+    data: config,
+    error: configError,
+  } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
     .single();
+
   if (configError || !config) {
     throw new BroadcastError(
       'whatsapp_not_configured',
@@ -122,16 +235,23 @@ export async function createBroadcast(
       400
     );
   }
-  const accessToken = decrypt(config.access_token);
 
-  // Template row (once) for header/button components; guard a
-  // malformed local row rather than N identical opaque failures.
-  const resolvedTemplate = await resolveTemplateRow(
-    db,
-    accountId,
-    templateName,
-    params.templateLanguage
+  const accessToken = decrypt(
+    config.access_token
   );
+
+  // ------------------------------------------------------------
+  // Template
+  // ------------------------------------------------------------
+
+  const resolvedTemplate =
+    await resolveTemplateRow(
+      db,
+      accountId,
+      templateName,
+      params.templateLanguage
+    );
+
   if (resolvedTemplate.malformed) {
     throw new BroadcastError(
       'template_malformed',
@@ -139,41 +259,117 @@ export async function createBroadcast(
       500
     );
   }
-  const templateRow = resolvedTemplate.row;
 
-  // Resolve each recipient to a contact. Invalid phones are dropped
-  // (counted as rejected) rather than aborting the whole broadcast.
-  const resolved: { contactId: string; phone: string; params: string[] }[] = [];
+  const templateRow =
+    resolvedTemplate.row;
+
+  // ------------------------------------------------------------
+  // Header media
+  // ------------------------------------------------------------
+
+  const normalizedHeaderMediaUrl =
+    typeof headerMediaUrl === 'string'
+      ? headerMediaUrl.trim()
+      : '';
+
+  /**
+   * If the caller does not explicitly provide a media URL,
+   * retain the template's configured media URL when one exists.
+   *
+   * This keeps existing templates with header_media_url working
+   * without forcing the frontend to duplicate that value.
+   */
+  const effectiveHeaderMediaUrl =
+    normalizedHeaderMediaUrl ||
+    templateRow?.header_media_url ||
+    null;
+
+  // ------------------------------------------------------------
+  // Contact resolution
+  // ------------------------------------------------------------
+
+  const resolved: {
+    contactId: string;
+    phone: string;
+    params: string[];
+  }[] = [];
+
   let rejected = 0;
-  for (const r of recipients) {
-    const sanitized = sanitizePhoneForMeta(typeof r.to === 'string' ? r.to : '');
+
+  for (const recipient of recipients) {
+    const sanitized =
+      sanitizePhoneForMeta(
+        typeof recipient.to === 'string'
+          ? recipient.to
+          : ''
+      );
+
     if (!isValidE164(sanitized)) {
       rejected++;
       continue;
     }
-    const { id } = await findOrCreateContact(db, accountId, auditUserId, {
-      phone: sanitized,
-    });
+
+    const { id } =
+      await findOrCreateContact(
+        db,
+        accountId,
+        auditUserId,
+        {
+          phone: sanitized,
+        }
+      );
+
     resolved.push({
       contactId: id,
       phone: sanitized,
-      params: Array.isArray(r.params)
-        ? r.params.filter((p): p is string => typeof p === 'string')
+      params: Array.isArray(
+        recipient.params
+      )
+        ? recipient.params.filter(
+            (
+              value
+            ): value is string =>
+              typeof value === 'string'
+          )
         : [],
     });
   }
 
-  // Collapse recipients that resolved to the SAME contact (the caller
-  // listed a phone twice, or two numbers fuzzy-matched to one contact).
-  // Keep the first occurrence so the contact is messaged once and its
-  // params aren't silently overwritten by a later duplicate — and so
-  // the row↔params pairing below (keyed by contact_id) is unambiguous.
-  const seenContact = new Set<string>();
-  const deduped = resolved.filter((r) => {
-    if (seenContact.has(r.contactId)) return false;
-    seenContact.add(r.contactId);
-    return true;
-  });
+  // ------------------------------------------------------------
+  // Contact deduplication
+  // ------------------------------------------------------------
+
+  /**
+   * A contact can only receive one message per broadcast.
+   *
+   * Conversation identity is contact-based, so duplicate recipients
+   * would otherwise produce duplicate messages in the same canonical
+   * conversation.
+   *
+   * The first occurrence wins and therefore its template params are
+   * authoritative.
+   */
+  const seenContact =
+    new Set<string>();
+
+  const deduped =
+    resolved.filter(
+      (recipient) => {
+        if (
+          seenContact.has(
+            recipient.contactId
+          )
+        ) {
+          return false;
+        }
+
+        seenContact.add(
+          recipient.contactId
+        );
+
+        return true;
+      }
+    );
 
   if (deduped.length === 0) {
     throw new BroadcastError(
@@ -183,174 +379,726 @@ export async function createBroadcast(
     );
   }
 
-  // Persist the broadcast + its recipients. The count columns
-  // (sent/delivered/read/replied/failed) are owned by the DB aggregate
-  // trigger (migrations 003/005) and derived purely from
-  // broadcast_recipients rows — we deliberately do NOT seed them here
-  // (a manual value would be clobbered by the trigger on the first
-  // recipient change). `rejected` phones have no recipient row, so they
-  // are reported to the caller in the POST response, not in these
-  // persisted counts.
-  // Insert the parent broadcast and its recipient rows in ONE transaction
-  // (migration 037's create_broadcast_with_recipients). Previously these
-  // were two separate inserts: if the recipient insert failed, the parent
-  // was already persisted with status 'sending' and no recipients, leaving
-  // an orphaned campaign that looked like it was sending but had no
-  // delivery plan (issue #370). The function body is atomic, so a recipient
-  // failure now rolls the parent back and nothing orphaned survives.
-  const { data: createdRows, error: createErr } = await db.rpc(
+  // ------------------------------------------------------------
+  // Atomic broadcast persistence
+  // ------------------------------------------------------------
+
+  /**
+   * Migration 039 provides the current RPC signature:
+   *
+   *   create_broadcast_with_recipients(
+   *     account_id,
+   *     user_id,
+   *     name,
+   *     template_name,
+   *     template_language,
+   *     total_recipients,
+   *     contact_ids,
+   *     template_params,
+   *     header_media_url
+   *   )
+   *
+   * The RPC atomically creates:
+   *
+   *   broadcasts
+   *   broadcast_recipients
+   *
+   * This prevents an orphaned broadcast if recipient insertion fails.
+   *
+   * Migration 038 freezes template_params per recipient so a later
+   * resume can reconstruct {{1}}, {{2}}, etc.
+   *
+   * Migration 039 additionally freezes the campaign-level media URL.
+   */
+  const {
+    data: createdRows,
+    error: createErr,
+  } = await db.rpc(
     'create_broadcast_with_recipients',
     {
-      p_account_id: accountId,
-      p_user_id: auditUserId,
-      p_name: name || `API broadcast (${templateName})`,
-      p_template_name: templateName,
-      p_template_language: resolvedTemplate.language,
-      p_total_recipients: deduped.length,
-      p_contact_ids: deduped.map((r) => r.contactId),
-      // Frozen per-recipient params (migration 038) — without them a
-      // resume of this broadcast has no way to reconstruct {{1}}.
-      p_template_params: deduped.map((r) => r.params),
+      p_account_id:
+        accountId,
+
+      p_user_id:
+        auditUserId,
+
+      p_name:
+        name ||
+        `API broadcast (${templateName})`,
+
+      p_template_name:
+        templateName,
+
+      p_template_language:
+        resolvedTemplate.language,
+
+      p_total_recipients:
+        deduped.length,
+
+      p_contact_ids:
+        deduped.map(
+          (recipient) =>
+            recipient.contactId
+        ),
+
+      p_template_params:
+        deduped.map(
+          (recipient) =>
+            recipient.params
+        ),
+
+      p_header_media_url:
+        effectiveHeaderMediaUrl,
     }
   );
-  if (createErr || !createdRows || createdRows.length === 0) {
-    console.error('[broadcast-core] create broadcast error:', createErr);
-    throw new BroadcastError('internal', 'Failed to create broadcast', 500);
+
+  if (
+    createErr ||
+    !createdRows ||
+    createdRows.length === 0
+  ) {
+    console.error(
+      '[broadcast-core] create broadcast error:',
+      createErr
+    );
+
+    throw new BroadcastError(
+      'internal',
+      'Failed to create broadcast',
+      500
+    );
   }
 
-  const broadcastId = createdRows[0].broadcast_id as string;
+  const broadcastId =
+    createdRows[0]
+      .broadcast_id as string;
 
-  // Pair each inserted recipient row back to its phone/params by
-  // contact_id — unambiguous now that duplicates are collapsed.
-  const byContact = new Map(deduped.map((r) => [r.contactId, r]));
-  const planned: PlannedRecipient[] = createdRows.map(
-    (row: { recipient_id: string; contact_id: string }) => {
-      const r = byContact.get(row.contact_id)!;
-      return { recipientRowId: row.recipient_id, phone: r.phone, params: r.params };
-    }
-  );
+  // ------------------------------------------------------------
+  // Map inserted rows back to resolved recipients
+  // ------------------------------------------------------------
+
+  const byContact =
+    new Map(
+      deduped.map(
+        (recipient) => [
+          recipient.contactId,
+          recipient,
+        ]
+      )
+    );
+
+  const planned: PlannedRecipient[] =
+    createdRows.map(
+      (row: {
+        recipient_id: string;
+        contact_id: string;
+      }) => {
+        const recipient =
+          byContact.get(
+            row.contact_id
+          );
+
+        if (!recipient) {
+          throw new BroadcastError(
+            'internal',
+            'Broadcast recipient could not be mapped to its contact',
+            500
+          );
+        }
+
+        return {
+          recipientRowId:
+            row.recipient_id,
+
+          contactId:
+            recipient.contactId,
+
+          phone:
+            recipient.phone,
+
+          params:
+            recipient.params,
+        };
+      }
+    );
 
   return {
     broadcastId,
+
+    accountId,
+
+    auditUserId,
+
     templateName,
-    templateLanguage: resolvedTemplate.language,
-    phoneNumberId: config.phone_number_id,
+
+    templateLanguage:
+      resolvedTemplate.language,
+
+    phoneNumberId:
+      config.phone_number_id,
+
     accessToken,
+
     templateRow,
+
+    headerMediaUrl:
+      effectiveHeaderMediaUrl,
+
     planned,
+
     rejected,
   };
 }
 
 /**
- * Fan out a {@link BroadcastPlan}: send each recipient's template
- * (phone-variant retry) and stamp its `broadcast_recipients` row.
- * Best-effort per recipient — one failure never aborts the rest.
- * Designed to run inside `after()`.
+ * Persist a successful broadcast send into the canonical conversation.
  *
- * The per-status count columns on `broadcasts` are owned by the DB
- * aggregate trigger (migrations 003/005): each recipient-row update
- * below advances them automatically, and later Meta delivery/read
- * webhooks keep advancing them. We therefore never write those columns
- * here — only the terminal `status` — otherwise a manual value would
- * race and clobber the trigger-maintained counts.
+ * IMPORTANT:
+ * This does NOT blindly create a new conversation.
+ *
+ * resolveConversationByPhone() resolves:
+ *
+ *   account_id + contact_id
+ *
+ * and returns the existing canonical conversation when available.
+ *
+ * The rendered template text is persisted in BOTH:
+ *
+ *   broadcast_recipients.message_text
+ *   messages.content_text
+ *
+ * This allows the broadcast recipient record to retain the exact
+ * text that was sent while the Inbox continues to use messages as
+ * its canonical message history.
+ */
+async function persistBroadcastMessage(
+  db: SupabaseClient,
+  plan: BroadcastPlan,
+  recipient: PlannedRecipient,
+  whatsappMessageId: string
+): Promise<void> {
+  // ------------------------------------------------------------
+  // Render the actual text using the frozen recipient parameters
+  // ------------------------------------------------------------
+
+  const renderedText =
+    templateContentText(
+      plan.templateRow,
+      recipient.params
+    ) ?? '';
+
+  // ------------------------------------------------------------
+  // Resolve canonical conversation
+  // ------------------------------------------------------------
+
+  const resolved =
+    await resolveConversationByPhone(
+      db,
+      plan.accountId,
+      recipient.phone
+    );
+
+  // ------------------------------------------------------------
+  // Persist text on broadcast_recipients
+  // ------------------------------------------------------------
+
+  const {
+    error: recipientTextError,
+  } = await db
+    .from('broadcast_recipients')
+    .update({
+      message_text:
+        renderedText,
+    })
+    .eq(
+      'id',
+      recipient.recipientRowId
+    );
+
+  if (recipientTextError) {
+    /**
+     * Do not abort the message persistence if this auxiliary field
+     * cannot be updated.
+     *
+     * The canonical messages table remains the source of truth
+     * for the Inbox.
+     */
+    console.error(
+      '[broadcast-core] failed to save broadcast recipient message text:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        error:
+          recipientTextError,
+      }
+    );
+  }
+
+  // ------------------------------------------------------------
+  // Persist the exact Meta send
+  // ------------------------------------------------------------
+
+  const {
+    error: messageError,
+  } = await db
+    .from('messages')
+    .insert({
+      conversation_id:
+        resolved.conversationId,
+
+      sender_type:
+        'agent',
+
+      sender_id:
+        plan.auditUserId,
+
+      content_type:
+        'template',
+
+      content_text:
+        renderedText,
+
+      template_name:
+        plan.templateName,
+
+      message_id:
+        whatsappMessageId,
+
+      status:
+        'sent',
+    });
+
+  if (messageError) {
+    /**
+     * Meta has already accepted the message.
+     *
+     * Therefore local persistence failure must NOT turn a successful
+     * WhatsApp send into a failed recipient.
+     */
+    console.error(
+      '[broadcast-core] failed to persist sent template message:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        conversationId:
+          resolved.conversationId,
+
+        contactId:
+          resolved.contactId,
+
+        whatsappMessageId,
+
+        renderedText,
+
+        error:
+          messageError,
+      }
+    );
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // Update Inbox preview
+  // ------------------------------------------------------------
+
+  const {
+    error: conversationError,
+  } = await db
+    .from('conversations')
+    .update({
+      last_message_text:
+        renderedText,
+
+      last_message_at:
+        new Date().toISOString(),
+
+      updated_at:
+        new Date().toISOString(),
+    })
+    .eq(
+      'id',
+      resolved.conversationId
+    )
+    .eq(
+      'account_id',
+      plan.accountId
+    );
+
+  if (conversationError) {
+    /**
+     * The message is already correctly persisted.
+     *
+     * Preview failure must not turn a successful WhatsApp send into
+     * a failed recipient.
+     */
+    console.error(
+      '[broadcast-core] failed to update conversation preview:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        conversationId:
+          resolved.conversationId,
+
+        error:
+          conversationError,
+      }
+    );
+  }
+}
+
+/**
+ * Fan out a BroadcastPlan.
+ *
+ * Each recipient is sent independently.
+ *
+ * A failure for one recipient never aborts the remaining recipients.
+ *
+ * This function is designed to run inside Next.js after().
  */
 export async function deliverBroadcast(
   db: SupabaseClient,
   plan: BroadcastPlan
 ): Promise<void> {
   for (const recipient of plan.planned) {
-    const variants = phoneVariants(recipient.phone);
-    let sentMessageId: string | null = null;
-    let lastError: string | null = null;
+    const variants =
+      phoneVariants(
+        recipient.phone
+      );
+
+    let sentMessageId:
+      | string
+      | null = null;
+
+    let lastError:
+      | string
+      | null = null;
+
+    // ----------------------------------------------------------
+    // Build structured send-time parameters
+    // ----------------------------------------------------------
+
+    const messageParams =
+      plan.headerMediaUrl
+        ? {
+            headerMediaUrl:
+              plan.headerMediaUrl,
+          }
+        : undefined;
+
+    // ----------------------------------------------------------
+    // Send through Meta
+    // ----------------------------------------------------------
 
     for (const variant of variants) {
       try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
-        });
-        sentMessageId = result.messageId;
+        const result =
+          await sendTemplateMessage({
+            phoneNumberId:
+              plan.phoneNumberId,
+
+            accessToken:
+              plan.accessToken,
+
+            to:
+              variant,
+
+            templateName:
+              plan.templateName,
+
+            language:
+              plan.templateLanguage,
+
+            template:
+              plan.templateRow ??
+              undefined,
+
+            params:
+              recipient.params,
+
+            messageParams,
+          });
+
+        sentMessageId =
+          result.messageId;
+
         lastError = null;
+
         break;
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unknown error';
+
         lastError = message;
-        // Only a "recipient not allowed" error is worth another variant.
-        if (!isRecipientNotAllowedError(message)) break;
+
+        /**
+         * Only retry phone variants for the specific
+         * "recipient not allowed" condition.
+         */
+        if (
+          !isRecipientNotAllowedError(
+            message
+          )
+        ) {
+          break;
+        }
       }
     }
 
+    // ------------------------------------------------------------
+    // Successful send
+    // ------------------------------------------------------------
+
     if (sentMessageId) {
-      await db
-        .from('broadcast_recipients')
+      /**
+       * Store the WAMID first.
+       *
+       * The inbound webhook later uses this same ID to advance
+       * the recipient/message status to delivered/read.
+       */
+      const {
+        error:
+          recipientUpdateError,
+      } = await db
+        .from(
+          'broadcast_recipients'
+        )
         .update({
-          status: 'sent',
-          sent_at: new Date().toISOString(),
-          whatsapp_message_id: sentMessageId,
-          error_message: null,
+          status:
+            'sent',
+
+          sent_at:
+            new Date().toISOString(),
+
+          whatsapp_message_id:
+            sentMessageId,
+
+          error_message:
+            null,
         })
-        .eq('id', recipient.recipientRowId);
+        .eq(
+          'id',
+          recipient.recipientRowId
+        );
+
+      if (
+        recipientUpdateError
+      ) {
+        console.error(
+          '[broadcast-core] failed to update broadcast recipient:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            recipientRowId:
+              recipient.recipientRowId,
+
+            whatsappMessageId:
+              sentMessageId,
+
+            error:
+              recipientUpdateError,
+          }
+        );
+      }
+
+      /**
+       * Persist the exact same Meta send into the canonical
+       * conversation.
+       *
+       * This also stores the rendered template text in:
+       *
+       *   broadcast_recipients.message_text
+       *   messages.content_text
+       *
+       * If this local operation fails, the WhatsApp message remains
+       * successful because Meta already accepted it.
+       */
+      await persistBroadcastMessage(
+        db,
+        plan,
+        recipient,
+        sentMessageId
+      );
     } else {
-      await db
-        .from('broadcast_recipients')
+      // --------------------------------------------------------
+      // Failed send
+      // --------------------------------------------------------
+
+      const {
+        error:
+          recipientUpdateError,
+      } = await db
+        .from(
+          'broadcast_recipients'
+        )
         .update({
-          status: 'failed',
-          error_message: lastError || 'Unknown error',
+          status:
+            'failed',
+
+          error_message:
+            lastError ||
+            'Unknown error',
         })
-        .eq('id', recipient.recipientRowId);
+        .eq(
+          'id',
+          recipient.recipientRowId
+        );
+
+      if (
+        recipientUpdateError
+      ) {
+        console.error(
+          '[broadcast-core] failed to mark broadcast recipient failed:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            recipientRowId:
+              recipient.recipientRowId,
+
+            error:
+              recipientUpdateError,
+          }
+        );
+      }
     }
   }
 
-  await finalizeBroadcastStatus(db, plan.broadcastId);
+  // ------------------------------------------------------------
+  // Finalize
+  // ------------------------------------------------------------
+
+  /**
+   * Rejected phones do not have recipient rows.
+   *
+   * The persisted campaign status is therefore derived from the
+   * persisted recipient rows.
+   */
+  await finalizeBroadcastStatus(
+    db,
+    plan.broadcastId
+  );
 }
 
 /**
- * Flip a broadcast out of `sending` once no recipient is left pending.
+ * Finalize a broadcast once no recipient remains pending.
  *
- * Derived from the recipient rows rather than from a counter local to
- * one delivery pass: a resume (issue #472) delivers only the leftovers,
- * so "nothing sent *this* pass" must not mark a campaign failed when
- * 800 of its 1 000 recipients went out earlier. `failed` means every
- * single recipient failed; anything else that reached Meta is `sent`,
- * with the per-recipient failures visible in `failed_count`.
+ * If pending rows still exist, the campaign remains "sending".
  *
- * Per-status counts stay trigger-owned (migrations 003/005) — only the
- * terminal `status` is written here.
+ * This is important for resumable delivery.
  */
 export async function finalizeBroadcastStatus(
   db: SupabaseClient,
   broadcastId: string
 ): Promise<void> {
-  const countWhere = async (status: string): Promise<number> => {
-    const { count } = await db
-      .from('broadcast_recipients')
-      .select('id', { count: 'exact', head: true })
-      .eq('broadcast_id', broadcastId)
-      .eq('status', status);
-    return count ?? 0;
-  };
+  const countWhere =
+    async (
+      status: string
+    ): Promise<number> => {
+      const { count } =
+        await db
+          .from(
+            'broadcast_recipients'
+          )
+          .select('id', {
+            count: 'exact',
+            head: true,
+          })
+          .eq(
+            'broadcast_id',
+            broadcastId
+          )
+          .eq(
+            'status',
+            status
+          );
 
-  // Still work outstanding (a capped resume pass) — leave it 'sending'
-  // so the UI keeps offering Resume.
-  if ((await countWhere('pending')) > 0) return;
+      return count ?? 0;
+    };
 
-  const failed = await countWhere('failed');
-  const { count: total } = await db
-    .from('broadcast_recipients')
-    .select('id', { count: 'exact', head: true })
-    .eq('broadcast_id', broadcastId);
+  // ------------------------------------------------------------
+  // Pending recipients
+  // ------------------------------------------------------------
+
+  if (
+    (await countWhere(
+      'pending'
+    )) > 0
+  ) {
+    /**
+     * A resumable campaign still has work.
+     *
+     * Keep "sending" so the UI can offer Resume.
+     */
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // Failed recipients
+  // ------------------------------------------------------------
+
+  const failed =
+    await countWhere(
+      'failed'
+    );
+
+  // ------------------------------------------------------------
+  // Total persisted recipients
+  // ------------------------------------------------------------
+
+  const {
+    count: total,
+  } = await db
+    .from(
+      'broadcast_recipients'
+    )
+    .select('id', {
+      count: 'exact',
+      head: true,
+    })
+    .eq(
+      'broadcast_id',
+      broadcastId
+    );
+
+  /**
+   * "failed" only when every persisted recipient failed.
+   *
+   * Otherwise, if at least one recipient reached Meta, the campaign
+   * is considered sent and failed_count exposes partial failures.
+   */
+  const terminalStatus =
+    failed > 0 &&
+    failed === (total ?? 0)
+      ? 'failed'
+      : 'sent';
 
   await db
     .from('broadcasts')
     .update({
-      status: failed > 0 && failed === (total ?? 0) ? 'failed' : 'sent',
-      updated_at: new Date().toISOString(),
+      status:
+        terminalStatus,
+
+      updated_at:
+        new Date().toISOString(),
     })
-    .eq('id', broadcastId);
+    .eq(
+      'id',
+      broadcastId
+    );
 }

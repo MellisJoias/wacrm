@@ -53,6 +53,7 @@ import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
 import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation';
+import { createAdminClient } from '@/lib/supabase/admin';
 
 /**
  * Thrown by createBroadcast on a caller-visible failure.
@@ -366,10 +367,12 @@ export async function createBroadcast(
   // Atomic broadcast persistence
   // ------------------------------------------------------------
 
+  const adminDb = createAdminClient();
+
   const {
     data: createdRows,
     error: createErr,
-  } = await db.rpc(
+  } = await adminDb.rpc(
     'create_broadcast_with_recipients',
     {
       p_account_id:

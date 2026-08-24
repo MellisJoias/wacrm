@@ -272,13 +272,6 @@ export async function createBroadcast(
       ? headerMediaUrl.trim()
       : '';
 
-  /**
-   * If the caller does not explicitly provide a media URL,
-   * retain the template's configured media URL when one exists.
-   *
-   * This keeps existing templates with header_media_url working
-   * without forcing the frontend to duplicate that value.
-   */
   const effectiveHeaderMediaUrl =
     normalizedHeaderMediaUrl ||
     templateRow?.header_media_url ||
@@ -339,16 +332,6 @@ export async function createBroadcast(
   // Contact deduplication
   // ------------------------------------------------------------
 
-  /**
-   * A contact can only receive one message per broadcast.
-   *
-   * Conversation identity is contact-based, so duplicate recipients
-   * would otherwise produce duplicate messages in the same canonical
-   * conversation.
-   *
-   * The first occurrence wins and therefore its template params are
-   * authoritative.
-   */
   const seenContact =
     new Set<string>();
 
@@ -383,33 +366,6 @@ export async function createBroadcast(
   // Atomic broadcast persistence
   // ------------------------------------------------------------
 
-  /**
-   * Migration 039 provides the current RPC signature:
-   *
-   *   create_broadcast_with_recipients(
-   *     account_id,
-   *     user_id,
-   *     name,
-   *     template_name,
-   *     template_language,
-   *     total_recipients,
-   *     contact_ids,
-   *     template_params,
-   *     header_media_url
-   *   )
-   *
-   * The RPC atomically creates:
-   *
-   *   broadcasts
-   *   broadcast_recipients
-   *
-   * This prevents an orphaned broadcast if recipient insertion fails.
-   *
-   * Migration 038 freezes template_params per recipient so a later
-   * resume can reconstruct {{1}}, {{2}}, etc.
-   *
-   * Migration 039 additionally freezes the campaign-level media URL.
-   */
   const {
     data: createdRows,
     error: createErr,
@@ -551,25 +507,20 @@ export async function createBroadcast(
 }
 
 /**
- * Resolve the template body used to render the local Inbox message.
+ * Resolve the local template used to reconstruct the message text.
  *
- * The delivery plan normally already contains templateRow. However,
- * asynchronous delivery, resumed broadcasts, older plans, tests or
- * other callers can provide a plan where templateRow is null.
- *
- * In that situation we query message_templates again using the
- * canonical account + template name + language.
- *
- * As a final fallback, we query any local row for the same account
- * and template name that has a body_text. This is intentionally
- * independent from the Meta send itself: Meta has already accepted
- * the message by the time this function is called.
+ * The send has already been accepted by Meta when this function is
+ * called. Therefore this function is strictly for local persistence.
  */
 async function resolveBroadcastTemplateForPersistence(
   db: SupabaseClient,
   plan: BroadcastPlan,
 ): Promise<MessageTemplate | null> {
-  if (plan.templateRow?.body_text) {
+  if (
+    plan.templateRow &&
+    typeof plan.templateRow.body_text === 'string' &&
+    plan.templateRow.body_text.length > 0
+  ) {
     return plan.templateRow;
   }
 
@@ -584,23 +535,21 @@ async function resolveBroadcastTemplateForPersistence(
 
     if (
       !resolved.malformed &&
-      resolved.row?.body_text
+      resolved.row &&
+      typeof resolved.row.body_text === 'string' &&
+      resolved.row.body_text.length > 0
     ) {
       return resolved.row;
     }
   } catch (error) {
     console.error(
-      '[broadcast-core] failed to resolve template through helper:',
+      '[broadcast-core] template resolution failed:',
       error,
     );
   }
 
   /**
-   * Final fallback.
-   *
-   * We deliberately do not require an exact language here.
-   * If there is a local template row with body_text, it is more useful
-   * for Inbox rendering than persisting an empty message.
+   * Last fallback: find any local translation containing body_text.
    */
   try {
     const {
@@ -612,7 +561,7 @@ async function resolveBroadcastTemplateForPersistence(
       .eq('account_id', plan.accountId)
       .eq('name', plan.templateName)
       .not('body_text', 'is', null)
-      .limit(10);
+      .limit(20);
 
     if (error) {
       console.error(
@@ -640,29 +589,24 @@ async function resolveBroadcastTemplateForPersistence(
       return null;
     }
 
-    /**
-     * Prefer the language used for the actual Meta send.
-     * Then fall back to the first row with body_text.
-     */
-    const wantedLanguage =
-      plan.templateLanguage
-        ?.toLowerCase();
+    const wanted =
+      plan.templateLanguage?.toLowerCase();
 
-    if (wantedLanguage) {
+    if (wanted) {
       const exact =
         rows.find(
           (row) =>
             typeof row.language === 'string' &&
-            row.language.toLowerCase() ===
-              wantedLanguage,
+            row.language.toLowerCase() === wanted &&
+            !!row.body_text,
         );
 
-      if (exact?.body_text) {
+      if (exact) {
         return exact;
       }
 
       const wantedBase =
-        wantedLanguage.split(/[_-]/)[0];
+        wanted.split(/[_-]/)[0];
 
       const sameBase =
         rows.find(
@@ -670,12 +614,11 @@ async function resolveBroadcastTemplateForPersistence(
             typeof row.language === 'string' &&
             row.language
               .toLowerCase()
-              .split(/[_-]/)[0] ===
-              wantedBase &&
+              .split(/[_-]/)[0] === wantedBase &&
             !!row.body_text,
         );
 
-      if (sameBase?.body_text) {
+      if (sameBase) {
         return sameBase;
       }
     }
@@ -698,23 +641,15 @@ async function resolveBroadcastTemplateForPersistence(
 /**
  * Persist a successful broadcast send into the canonical conversation.
  *
- * IMPORTANT:
- * This does NOT blindly create a new conversation.
+ * This is the critical Inbox persistence path.
  *
- * resolveConversationByPhone() resolves:
- *
- *   account_id + contact_id
- *
- * and returns the existing canonical conversation when available.
- *
- * The rendered template text is persisted in BOTH:
+ * One successful Meta send must result in:
  *
  *   broadcast_recipients.message_text
  *   messages.content_text
+ *   conversations.last_message_text
  *
- * This allows the broadcast recipient record to retain the exact
- * text that was sent while the Inbox continues to use messages as
- * its canonical message history.
+ * using the SAME conversation_id.
  */
 async function persistBroadcastMessage(
   db: SupabaseClient,
@@ -723,23 +658,9 @@ async function persistBroadcastMessage(
   whatsappMessageId: string,
 ): Promise<void> {
   // ------------------------------------------------------------
-  // Resolve template used for persistence
+  // Resolve template
   // ------------------------------------------------------------
 
-  /**
-   * The old implementation trusted plan.templateRow exclusively.
-   *
-   * When that value was null, templateContentText() returned null,
-   * which caused:
-   *
-   *   broadcast_recipients.message_text = NULL
-   *   messages.content_text = ''
-   *
-   * The WhatsApp message itself was successful, but the Inbox had
-   * nothing to render.
-   *
-   * Resolve the local template again before inserting the message.
-   */
   const templateRow =
     await resolveBroadcastTemplateForPersistence(
       db,
@@ -747,25 +668,73 @@ async function persistBroadcastMessage(
     );
 
   // ------------------------------------------------------------
-  // Render the actual text using the frozen recipient parameters
+  // Render exact body
   // ------------------------------------------------------------
 
   const renderedText =
     templateContentText(
       templateRow,
       recipient.params,
-    ) ?? '';
+    );
 
-  /**
-   * If we still cannot render a body, do not invent text.
-   *
-   * The message is still persisted, because Meta already accepted it.
-   * We log the exact reason so the missing local template can be
-   * diagnosed without losing the canonical message record.
-   */
-  if (!renderedText) {
+  const finalText =
+    typeof renderedText === 'string'
+      ? renderedText.trim()
+      : '';
+
+  console.log(
+    '[broadcast-core] persistence payload:',
+    {
+      broadcastId:
+        plan.broadcastId,
+
+      recipientRowId:
+        recipient.recipientRowId,
+
+      contactId:
+        recipient.contactId,
+
+      phone:
+        recipient.phone,
+
+      templateName:
+        plan.templateName,
+
+      templateLanguage:
+        plan.templateLanguage,
+
+      templateFound:
+        !!templateRow,
+
+      templateBody:
+        templateRow?.body_text ?? null,
+
+      templateParams:
+        recipient.params,
+
+      renderedText:
+        finalText,
+
+      whatsappMessageId,
+    },
+  );
+
+  // ------------------------------------------------------------
+  // Resolve canonical conversation
+  // ------------------------------------------------------------
+
+  let resolved;
+
+  try {
+    resolved =
+      await resolveConversationByPhone(
+        db,
+        plan.accountId,
+        recipient.phone,
+      );
+  } catch (error) {
     console.error(
-      '[broadcast-core] template body could not be rendered for Inbox:',
+      '[broadcast-core] failed to resolve canonical conversation:',
       {
         broadcastId:
           plan.broadcastId,
@@ -773,39 +742,61 @@ async function persistBroadcastMessage(
         recipientRowId:
           recipient.recipientRowId,
 
-        conversationTemplate:
-          plan.templateName,
+        contactId:
+          recipient.contactId,
 
-        templateLanguage:
-          plan.templateLanguage,
+        phone:
+          recipient.phone,
 
-        templateRowFound:
-          !!templateRow,
+        error,
+      },
+    );
 
-        hasBodyText:
-          !!templateRow?.body_text,
+    return;
+  }
 
-        templateParams:
-          recipient.params,
+  if (!resolved?.conversationId) {
+    console.error(
+      '[broadcast-core] canonical conversation was not resolved:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        contactId:
+          recipient.contactId,
+
+        phone:
+          recipient.phone,
 
         whatsappMessageId,
       },
     );
+
+    return;
   }
 
-  // ------------------------------------------------------------
-  // Resolve canonical conversation
-  // ------------------------------------------------------------
+  console.log(
+    '[broadcast-core] canonical conversation resolved:',
+    {
+      conversationId:
+        resolved.conversationId,
 
-  const resolved =
-    await resolveConversationByPhone(
-      db,
-      plan.accountId,
-      recipient.phone,
-    );
+      contactId:
+        resolved.contactId,
+
+      broadcastId:
+        plan.broadcastId,
+
+      recipientRowId:
+        recipient.recipientRowId,
+    },
+  );
 
   // ------------------------------------------------------------
-  // Persist text on broadcast_recipients
+  // Persist rendered text on broadcast_recipients
   // ------------------------------------------------------------
 
   const {
@@ -814,7 +805,7 @@ async function persistBroadcastMessage(
     .from('broadcast_recipients')
     .update({
       message_text:
-        renderedText || null,
+        finalText || null,
     })
     .eq(
       'id',
@@ -822,15 +813,8 @@ async function persistBroadcastMessage(
     );
 
   if (recipientTextError) {
-    /**
-     * Do not abort the message persistence if this auxiliary field
-     * cannot be updated.
-     *
-     * The canonical messages table remains the source of truth
-     * for the Inbox.
-     */
     console.error(
-      '[broadcast-core] failed to save broadcast recipient message text:',
+      '[broadcast-core] FAILED broadcast_recipients.message_text update:',
       {
         broadcastId:
           plan.broadcastId,
@@ -838,55 +822,81 @@ async function persistBroadcastMessage(
         recipientRowId:
           recipient.recipientRowId,
 
+        renderedText:
+          finalText,
+
         error:
           recipientTextError,
+      },
+    );
+  } else {
+    console.log(
+      '[broadcast-core] broadcast_recipients.message_text saved:',
+      {
+        recipientRowId:
+          recipient.recipientRowId,
+
+        messageText:
+          finalText,
       },
     );
   }
 
   // ------------------------------------------------------------
-  // Persist the exact Meta send
+  // Insert canonical messages row
   // ------------------------------------------------------------
 
+  /**
+   * Do NOT skip the insert when the local template body is missing.
+   *
+   * The Meta message already exists.
+   *
+   * Persisting the canonical row is more important than silently
+   * dropping the message from the Inbox.
+   */
+  const messagePayload = {
+    conversation_id:
+      resolved.conversationId,
+
+    sender_type:
+      'agent',
+
+    sender_id:
+      plan.auditUserId,
+
+    content_type:
+      'template',
+
+    content_text:
+      finalText || null,
+
+    template_name:
+      plan.templateName,
+
+    message_id:
+      whatsappMessageId,
+
+    status:
+      'sent',
+  };
+
+  console.log(
+    '[broadcast-core] inserting messages row:',
+    messagePayload,
+  );
+
   const {
+    data: insertedMessage,
     error: messageError,
   } = await db
     .from('messages')
-    .insert({
-      conversation_id:
-        resolved.conversationId,
-
-      sender_type:
-        'agent',
-
-      sender_id:
-        plan.auditUserId,
-
-      content_type:
-        'template',
-
-      content_text:
-        renderedText || null,
-
-      template_name:
-        plan.templateName,
-
-      message_id:
-        whatsappMessageId,
-
-      status:
-        'sent',
-    });
+    .insert(messagePayload)
+    .select('id, conversation_id, content_type, content_text, template_name, message_id, status, created_at')
+    .single();
 
   if (messageError) {
-    /**
-     * Meta has already accepted the message.
-     *
-     * Therefore local persistence failure must NOT turn a successful
-     * WhatsApp send into a failed recipient.
-     */
     console.error(
-      '[broadcast-core] failed to persist sent template message:',
+      '[broadcast-core] FAILED messages INSERT:',
       {
         broadcastId:
           plan.broadcastId,
@@ -902,7 +912,11 @@ async function persistBroadcastMessage(
 
         whatsappMessageId,
 
-        renderedText,
+        renderedText:
+          finalText,
+
+        payload:
+          messagePayload,
 
         error:
           messageError,
@@ -912,67 +926,44 @@ async function persistBroadcastMessage(
     return;
   }
 
+  console.log(
+    '[broadcast-core] messages row inserted successfully:',
+    insertedMessage,
+  );
+
   // ------------------------------------------------------------
-  // Update Inbox preview
+  // Update Inbox conversation preview
   // ------------------------------------------------------------
 
-  /**
-   * Only update the conversation preview when we actually have text.
-   *
-   * This prevents a failed local template lookup from overwriting
-   * an existing conversation preview with an empty string.
-   */
-  if (renderedText) {
-    const {
-      error: conversationError,
-    } = await db
-      .from('conversations')
-      .update({
-        last_message_text:
-          renderedText,
+  const now =
+    new Date().toISOString();
 
-        last_message_at:
-          new Date().toISOString(),
+  const {
+    error: conversationError,
+  } = await db
+    .from('conversations')
+    .update({
+      last_message_text:
+        finalText || '[template]',
 
-        updated_at:
-          new Date().toISOString(),
-      })
-      .eq(
-        'id',
-        resolved.conversationId,
-      )
-      .eq(
-        'account_id',
-        plan.accountId,
-      );
+      last_message_at:
+        now,
 
-    if (conversationError) {
-      /**
-       * The message is already correctly persisted.
-       *
-       * Preview failure must not turn a successful WhatsApp send into
-       * a failed recipient.
-       */
-      console.error(
-        '[broadcast-core] failed to update conversation preview:',
-        {
-          broadcastId:
-            plan.broadcastId,
+      updated_at:
+        now,
+    })
+    .eq(
+      'id',
+      resolved.conversationId,
+    )
+    .eq(
+      'account_id',
+      plan.accountId,
+    );
 
-          recipientRowId:
-            recipient.recipientRowId,
-
-          conversationId:
-            resolved.conversationId,
-
-          error:
-            conversationError,
-        },
-      );
-    }
-  } else {
+  if (conversationError) {
     console.error(
-      '[broadcast-core] skipped conversation preview update because rendered template text is empty:',
+      '[broadcast-core] FAILED conversations preview update:',
       {
         broadcastId:
           plan.broadcastId,
@@ -983,17 +974,30 @@ async function persistBroadcastMessage(
         conversationId:
           resolved.conversationId,
 
-        templateName:
-          plan.templateName,
+        renderedText:
+          finalText,
 
-        templateLanguage:
-          plan.templateLanguage,
-
-        templateParams:
-          recipient.params,
+        error:
+          conversationError,
       },
     );
+
+    return;
   }
+
+  console.log(
+    '[broadcast-core] Inbox conversation preview updated:',
+    {
+      conversationId:
+        resolved.conversationId,
+
+      lastMessageText:
+        finalText || '[template]',
+
+      lastMessageAt:
+        now,
+    },
+  );
 }
 
 /**
@@ -1022,10 +1026,6 @@ export async function deliverBroadcast(
     let lastError:
       | string
       | null = null;
-
-    // ----------------------------------------------------------
-    // Build structured send-time parameters
-    // ----------------------------------------------------------
 
     const messageParams =
       plan.headerMediaUrl
@@ -1080,12 +1080,29 @@ export async function deliverBroadcast(
             ? error.message
             : 'Unknown error';
 
-        lastError = message;
+        lastError =
+          message;
 
-        /**
-         * Only retry phone variants for the specific
-         * "recipient not allowed" condition.
-         */
+        console.error(
+          '[broadcast-core] Meta template send failed:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            recipientRowId:
+              recipient.recipientRowId,
+
+            phone:
+              variant,
+
+            templateName:
+              plan.templateName,
+
+            error:
+              message,
+          },
+        );
+
         if (
           !isRecipientNotAllowedError(
             message,
@@ -1101,12 +1118,6 @@ export async function deliverBroadcast(
     // ------------------------------------------------------------
 
     if (sentMessageId) {
-      /**
-       * Store the WAMID first.
-       *
-       * The inbound webhook later uses this same ID to advance
-       * the recipient/message status to delivered/read.
-       */
       const {
         error:
           recipientUpdateError,
@@ -1154,16 +1165,7 @@ export async function deliverBroadcast(
       }
 
       /**
-       * Persist the exact same Meta send into the canonical
-       * conversation.
-       *
-       * This also stores the rendered template text in:
-       *
-       *   broadcast_recipients.message_text
-       *   messages.content_text
-       *
-       * If this local operation fails, the WhatsApp message remains
-       * successful because Meta already accepted it.
+       * Critical canonical persistence.
        */
       await persistBroadcastMessage(
         db,
@@ -1216,16 +1218,6 @@ export async function deliverBroadcast(
     }
   }
 
-  // ------------------------------------------------------------
-  // Finalize
-  // ------------------------------------------------------------
-
-  /**
-   * Rejected phones do not have recipient rows.
-   *
-   * The persisted campaign status is therefore derived from the
-   * persisted recipient rows.
-   */
   await finalizeBroadcastStatus(
     db,
     plan.broadcastId,
@@ -1236,8 +1228,6 @@ export async function deliverBroadcast(
  * Finalize a broadcast once no recipient remains pending.
  *
  * If pending rows still exist, the campaign remains "sending".
- *
- * This is important for resumable delivery.
  */
 export async function finalizeBroadcastStatus(
   db: SupabaseClient,
@@ -1268,35 +1258,18 @@ export async function finalizeBroadcastStatus(
       return count ?? 0;
     };
 
-  // ------------------------------------------------------------
-  // Pending recipients
-  // ------------------------------------------------------------
-
   if (
     (await countWhere(
       'pending',
     )) > 0
   ) {
-    /**
-     * A resumable campaign still has work.
-     *
-     * Keep "sending" so the UI can offer Resume.
-     */
     return;
   }
-
-  // ------------------------------------------------------------
-  // Failed recipients
-  // ------------------------------------------------------------
 
   const failed =
     await countWhere(
       'failed',
     );
-
-  // ------------------------------------------------------------
-  // Total persisted recipients
-  // ------------------------------------------------------------
 
   const {
     count: total,
@@ -1313,12 +1286,6 @@ export async function finalizeBroadcastStatus(
       broadcastId,
     );
 
-  /**
-   * "failed" only when every persisted recipient failed.
-   *
-   * Otherwise, if at least one recipient reached Meta, the campaign
-   * is considered sent and failed_count exposes partial failures.
-   */
   const terminalStatus =
     failed > 0 &&
     failed === (total ?? 0)

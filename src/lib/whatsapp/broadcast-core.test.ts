@@ -378,6 +378,16 @@ interface DeliveryWrites {
   conversationUpdate?: Record<string, unknown>;
 }
 
+function mergeWrite(
+  current: Record<string, unknown> | undefined,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...(current ?? {}),
+    ...next,
+  };
+}
+
 function makeDeliveryDb(
   writes: DeliveryWrites,
   recipientCounts: Record<string, number> = {
@@ -416,7 +426,10 @@ function makeDeliveryDb(
             row: Record<string, unknown>,
           ) => {
             writes.recipientUpdate =
-              row;
+              mergeWrite(
+                writes.recipientUpdate,
+                row,
+              );
 
             return chain;
           },
@@ -479,7 +492,10 @@ function makeDeliveryDb(
             row: Record<string, unknown>,
           ) => {
             writes.messageInsert =
-              row;
+              mergeWrite(
+                writes.messageInsert,
+                row,
+              );
 
             return Promise.resolve({
               data: null,
@@ -504,7 +520,10 @@ function makeDeliveryDb(
             row: Record<string, unknown>,
           ) => {
             writes.conversationUpdate =
-              row;
+              mergeWrite(
+                writes.conversationUpdate,
+                row,
+              );
 
             return chain;
           },
@@ -614,9 +633,14 @@ describe(
           writes.recipientUpdate,
         ).toMatchObject({
           status: 'sent',
+
           whatsapp_message_id:
             'wamid-test-1',
+
           error_message: null,
+
+          message_text:
+            'Olá Maria, sua oferta é R$ 100,00.',
         });
 
         expect(
@@ -778,7 +802,10 @@ describe(
                   >,
                 ) => {
                   writes.recipientUpdate =
-                    row;
+                    mergeWrite(
+                      writes.recipientUpdate,
+                      row,
+                    );
 
                   return chain;
                 },
@@ -879,7 +906,10 @@ describe(
                   >,
                 ) => {
                   writes.conversationUpdate =
-                    row;
+                    mergeWrite(
+                      writes.conversationUpdate,
+                      row,
+                    );
 
                   return chain;
                 },

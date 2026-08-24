@@ -551,6 +551,171 @@ export async function createBroadcast(
 }
 
 /**
+ * Resolve the local template row again immediately before persisting
+ * the sent message.
+ *
+ * Why this exists:
+ *
+ * The Meta send can succeed even when `plan.templateRow` is null or
+ * missing `body_text`. In that case we still need the local template
+ * body to render the exact text into messages.content_text.
+ *
+ * This is deliberately best-effort. If the template does not exist
+ * locally, we cannot invent the text that Meta rendered.
+ */
+async function resolveBroadcastTemplateForPersistence(
+  db: SupabaseClient,
+  plan: BroadcastPlan,
+): Promise<MessageTemplate | null> {
+  if (
+    plan.templateRow &&
+    typeof plan.templateRow.body_text === 'string' &&
+    plan.templateRow.body_text.trim()
+  ) {
+    return plan.templateRow;
+  }
+
+  try {
+    const resolved =
+      await resolveTemplateRow(
+        db,
+        plan.accountId,
+        plan.templateName,
+        plan.templateLanguage,
+      );
+
+    if (
+      resolved.row &&
+      typeof resolved.row.body_text === 'string' &&
+      resolved.row.body_text.trim()
+    ) {
+      return resolved.row;
+    }
+  } catch (error) {
+    console.error(
+      '[broadcast-core] failed to re-resolve template for persistence:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        templateName:
+          plan.templateName,
+
+        templateLanguage:
+          plan.templateLanguage,
+
+        error,
+      },
+    );
+  }
+
+  /**
+   * Last local fallback.
+   *
+   * This handles cases where the helper intentionally returned null
+   * because the requested language was not an exact local match,
+   * while another local translation of the same template exists.
+   */
+  try {
+    const {
+      data,
+      error,
+    } = await db
+      .from('message_templates')
+      .select('*')
+      .eq('account_id', plan.accountId)
+      .eq('name', plan.templateName);
+
+    if (error) {
+      console.error(
+        '[broadcast-core] direct template fallback query failed:',
+        {
+          broadcastId:
+            plan.broadcastId,
+
+          templateName:
+            plan.templateName,
+
+          error,
+        },
+      );
+
+      return null;
+    }
+
+    const rows =
+      Array.isArray(data)
+        ? (data as MessageTemplate[])
+        : [];
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    /**
+     * Prefer the same language used for the Meta send.
+     * Then fall back to any row that actually contains body_text.
+     */
+    const wantedLanguage =
+      plan.templateLanguage?.toLowerCase();
+
+    const exact =
+      rows.find(
+        (row) =>
+          row.language?.toLowerCase() ===
+          wantedLanguage &&
+          typeof row.body_text === 'string' &&
+          row.body_text.trim(),
+      );
+
+    if (exact) {
+      return exact;
+    }
+
+    const wantedBase =
+      wantedLanguage?.split(/[_-]/)[0];
+
+    const sameBase =
+      rows.find(
+        (row) =>
+          typeof row.language === 'string' &&
+          row.language
+            .toLowerCase()
+            .split(/[_-]/)[0] === wantedBase &&
+          typeof row.body_text === 'string' &&
+          row.body_text.trim(),
+      );
+
+    if (sameBase) {
+      return sameBase;
+    }
+
+    return (
+      rows.find(
+        (row) =>
+          typeof row.body_text === 'string' &&
+          row.body_text.trim(),
+      ) ?? null
+    );
+  } catch (error) {
+    console.error(
+      '[broadcast-core] direct template fallback threw:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        templateName:
+          plan.templateName,
+
+        error,
+      },
+    );
+
+    return null;
+  }
+}
+
+/**
  * Persist a successful broadcast send into the canonical conversation.
  *
  * IMPORTANT:
@@ -578,14 +743,66 @@ async function persistBroadcastMessage(
   whatsappMessageId: string,
 ): Promise<void> {
   // ------------------------------------------------------------
+  // Resolve the template body
+  // ------------------------------------------------------------
+
+  /**
+   * Do not rely only on plan.templateRow.
+   *
+   * A broadcast can be accepted by Meta even when the local plan
+   * does not contain a usable body_text. Re-resolve the template
+   * immediately before persistence so the Inbox receives the
+   * rendered text.
+   */
+  const templateRow =
+    await resolveBroadcastTemplateForPersistence(
+      db,
+      plan,
+    );
+
+  // ------------------------------------------------------------
   // Render the actual text using the frozen recipient parameters
   // ------------------------------------------------------------
 
-  const renderedText =
+  const renderedTemplateText =
     templateContentText(
-      plan.templateRow,
+      templateRow,
       recipient.params,
-    ) ?? '';
+    );
+
+  /**
+   * Never silently replace an unavailable template body with an
+   * empty string. An empty value is not useful in the Inbox and
+   * makes diagnosis harder.
+   */
+  const renderedText =
+    typeof renderedTemplateText === 'string'
+      ? renderedTemplateText
+      : '';
+
+  if (!renderedText) {
+    console.error(
+      '[broadcast-core] template was sent but could not be rendered locally:',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        templateName:
+          plan.templateName,
+
+        templateLanguage:
+          plan.templateLanguage,
+
+        params:
+          recipient.params,
+
+        whatsappMessageId,
+      },
+    );
+  }
 
   // ------------------------------------------------------------
   // Resolve canonical conversation

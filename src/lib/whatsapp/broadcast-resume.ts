@@ -1,30 +1,38 @@
 // ============================================================
 // Broadcast resume / retry (issue #472).
 //
-// The dashboard wizard drives its own send loop from the browser tab
-// that started the campaign, so closing the tab abandons the campaign
-// mid-flight: the remaining recipients stay 'pending' and the
-// broadcast sits in 'sending' forever. This module is the recovery —
-// and the same machinery answers the reporter's other two asks,
-// "reprocess pending" and "reprocess failed".
+// Recovers broadcasts whose browser-driven delivery stopped
+// mid-flight, and supports retrying failed recipients.
 //
-// It deliberately reuses `deliverBroadcast` rather than growing a
-// second fan-out loop: same phone-variant retry, same per-recipient
-// stamping, same trigger-owned counts.
-//
-// What it does NOT do is move the *initial* send server-side. The
-// wizard still owns that; this makes an abandoned one recoverable.
+// The actual sending is delegated to deliverBroadcast() so that
+// initial delivery and resume delivery use exactly the same
+// per-recipient behavior.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-core';
-import { decrypt } from '@/lib/whatsapp/encryption';
-import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
-import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
+import {
+  BroadcastError,
+  type BroadcastPlan,
+} from '@/lib/whatsapp/broadcast-core';
 
-/** Which recipients a resume pass picks up. */
-export type ResumeScope = 'pending' | 'failed' | 'all';
+import { decrypt } from '@/lib/whatsapp/encryption';
+
+import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
+
+import {
+  sanitizePhoneForMeta,
+  isValidE164,
+} from '@/lib/whatsapp/phone-utils';
+
+// ============================================================
+// Resume scopes
+// ============================================================
+
+export type ResumeScope =
+  | 'pending'
+  | 'failed'
+  | 'all';
 
 export const RESUME_SCOPES: readonly ResumeScope[] = [
   'pending',
@@ -32,38 +40,37 @@ export const RESUME_SCOPES: readonly ResumeScope[] = [
   'all',
 ];
 
-/**
- * Recipients delivered per resume request. One pass runs inside
- * `after()`, so it is bounded by the host's function timeout — the cap
- * keeps a 5 000-recipient backlog from being one un-completable unit
- * of work. Whatever is left stays 'pending' and the caller is told how
- * many, so the UI can offer Resume again. Matches the public API's
- * per-request recipient cap.
- */
+// ============================================================
+// Limits / lock
+// ============================================================
+
 export const RESUME_MAX_PER_REQUEST = 1000;
 
-/**
- * How long a `delivery_locked_at` stamp is honoured before it is read
- * as abandoned. Long enough that a legitimately slow pass is never
- * stolen from, short enough that a crashed one doesn't wedge the
- * campaign until someone touches the database.
- */
-export const DELIVERY_LOCK_STALE_MS = 30 * 60 * 1000;
+export const DELIVERY_LOCK_STALE_MS =
+  30 * 60 * 1000;
 
-function scopeStatuses(scope: ResumeScope): string[] {
-  if (scope === 'pending') return ['pending'];
-  if (scope === 'failed') return ['failed'];
+// ============================================================
+// Helpers
+// ============================================================
+
+function scopeStatuses(
+  scope: ResumeScope
+): string[] {
+  if (scope === 'pending') {
+    return ['pending'];
+  }
+
+  if (scope === 'failed') {
+    return ['failed'];
+  }
+
   return ['pending', 'failed'];
 }
 
-/**
- * Take the delivery lock for a broadcast.
- *
- * One conditional UPDATE, so the claim is atomic: a concurrent caller's
- * WHERE no longer matches and it gets `false`. Returns false when the
- * broadcast doesn't exist on this account, too — the caller treats both
- * as "not yours to run".
- */
+// ============================================================
+// Delivery lock
+// ============================================================
+
 export async function claimBroadcastDelivery(
   db: SupabaseClient,
   accountId: string,
@@ -76,124 +83,250 @@ export async function claimBroadcastDelivery(
 
   const { data, error } = await db
     .from('broadcasts')
-    .update({ delivery_locked_at: now.toISOString() })
+    .update({
+      delivery_locked_at: now.toISOString(),
+    })
     .eq('id', broadcastId)
     .eq('account_id', accountId)
-    .or(`delivery_locked_at.is.null,delivery_locked_at.lt.${staleCutoff}`)
+    .or(
+      `delivery_locked_at.is.null,delivery_locked_at.lt.${staleCutoff}`
+    )
     .select('id');
 
   if (error) {
-    console.error('[broadcast-resume] claim failed:', error.message);
+    console.error(
+      '[broadcast-resume] claim failed:',
+      error.message
+    );
+
     return false;
   }
-  return Array.isArray(data) && data.length > 0;
+
+  return (
+    Array.isArray(data) &&
+    data.length > 0
+  );
 }
 
-/** Release the delivery lock. Best-effort; a stale lock self-expires. */
+// ============================================================
+// Release delivery lock
+// ============================================================
+
 export async function releaseBroadcastDelivery(
   db: SupabaseClient,
   broadcastId: string
 ): Promise<void> {
   const { error } = await db
     .from('broadcasts')
-    .update({ delivery_locked_at: null })
+    .update({
+      delivery_locked_at: null,
+    })
     .eq('id', broadcastId);
+
   if (error) {
-    console.error('[broadcast-resume] release failed:', error.message);
+    console.error(
+      '[broadcast-resume] release failed:',
+      error.message
+    );
   }
 }
 
+// ============================================================
+// Resume plan
+// ============================================================
+
 export interface ResumePlan {
   plan: BroadcastPlan;
-  /** In-scope recipients left over after the per-request cap. */
-  remaining: number;
+
   /**
-   * In-scope rows that can never send because their contact has no
-   * usable phone. Stamped 'failed' by {@link planBroadcastResume} so
-   * they stop blocking the broadcast's terminal status.
+   * Recipients still waiting after the per-request cap.
+   */
+  remaining: number;
+
+  /**
+   * Recipients that cannot be sent because their contact
+   * has no valid phone number.
    */
   unsendable: number;
 }
 
+// ============================================================
+// Database row
+// ============================================================
+
 interface RecipientRow {
   id: string;
+
+  /**
+   * Canonical contact associated with the recipient.
+   *
+   * Required because BroadcastPlan / PlannedRecipient use
+   * contactId to preserve the canonical conversation identity.
+   */
+  contact_id: string;
+
+  /**
+   * Frozen template parameters persisted by migration 038.
+   */
   template_params: unknown;
-  contact: { phone?: string | null } | { phone?: string | null }[] | null;
+
+  contact:
+    | {
+        phone?: string | null;
+      }
+    | {
+        phone?: string | null;
+      }[]
+    | null;
 }
 
-/** Supabase renders an embedded to-one join as an object or a 1-array. */
-function contactPhone(row: RecipientRow): string | null {
-  const c = Array.isArray(row.contact) ? row.contact[0] : row.contact;
-  return c?.phone ?? null;
+// Supabase can return a to-one relationship either as an
+// object or as a one-element array.
+function contactPhone(
+  row: RecipientRow
+): string | null {
+  const contact = Array.isArray(row.contact)
+    ? row.contact[0]
+    : row.contact;
+
+  return contact?.phone ?? null;
 }
 
-/**
- * Build a {@link BroadcastPlan} for the recipients of an existing
- * broadcast that still need sending.
- *
- * Params come off the recipient rows (frozen at plan time by migration
- * 038) rather than being re-resolved from contact data, so a resume
- * sends what the original pass would have sent even if the contact has
- * been edited since.
- *
- * Throws {@link BroadcastError}; the route maps it.
- */
+// ============================================================
+// Build resume plan
+// ============================================================
+
 export async function planBroadcastResume(
   db: SupabaseClient,
   accountId: string,
+  auditUserId: string,
   broadcastId: string,
   scope: ResumeScope
 ): Promise<ResumePlan> {
-  const { data: broadcast, error: bcError } = await db
+  // ----------------------------------------------------------
+  // Load broadcast
+  // ----------------------------------------------------------
+
+  const {
+    data: broadcast,
+    error: broadcastError,
+  } = await db
     .from('broadcasts')
-    .select('id, template_name, template_language')
+    .select(
+      'id, template_name, template_language, header_media_url'
+    )
     .eq('id', broadcastId)
     .eq('account_id', accountId)
     .maybeSingle();
 
-  if (bcError || !broadcast) {
-    throw new BroadcastError('not_found', 'Broadcast not found', 404);
+  if (
+    broadcastError ||
+    !broadcast
+  ) {
+    throw new BroadcastError(
+      'not_found',
+      'Broadcast not found',
+      404
+    );
   }
 
-  const statuses = scopeStatuses(scope);
-  const { data: rawRows, error: recError } = await db
+  // ----------------------------------------------------------
+  // Load recipients
+  // ----------------------------------------------------------
+
+  const statuses =
+    scopeStatuses(scope);
+
+  const {
+    data: rawRows,
+    error: recipientError,
+  } = await db
     .from('broadcast_recipients')
-    .select('id, template_params, contact:contacts(phone)')
+    .select(
+      'id, contact_id, template_params, contact:contacts(phone)'
+    )
     .eq('broadcast_id', broadcastId)
     .in('status', statuses)
-    // Oldest first, so repeated capped passes chew through the backlog
-    // in a stable order instead of re-picking the same slice.
-    .order('created_at', { ascending: true });
+    .order('created_at', {
+      ascending: true,
+    });
 
-  if (recError) {
-    console.error('[broadcast-resume] recipient load failed:', recError.message);
-    throw new BroadcastError('internal', 'Failed to load recipients', 500);
+  if (recipientError) {
+    console.error(
+      '[broadcast-resume] recipient load failed:',
+      recipientError.message
+    );
+
+    throw new BroadcastError(
+      'internal',
+      'Failed to load recipients',
+      500
+    );
   }
 
-  const rows = (rawRows ?? []) as RecipientRow[];
+  const rows =
+    (rawRows ?? []) as RecipientRow[];
 
-  // A recipient whose contact has no usable phone can never send. Stamp
-  // it failed now: leaving it 'pending' would keep the broadcast in
-  // 'sending' forever, which is the very symptom being fixed.
+  // ----------------------------------------------------------
+  // Separate sendable / unsendable recipients
+  // ----------------------------------------------------------
+
   const sendable: RecipientRow[] = [];
-  const unsendable: string[] = [];
+
+  const unsendableIds: string[] = [];
+
   for (const row of rows) {
-    const sanitized = sanitizePhoneForMeta(contactPhone(row) ?? '');
-    if (isValidE164(sanitized)) sendable.push(row);
-    else unsendable.push(row.id);
+    const phone =
+      sanitizePhoneForMeta(
+        contactPhone(row) ?? ''
+      );
+
+    if (isValidE164(phone)) {
+      sendable.push(row);
+    } else {
+      unsendableIds.push(row.id);
+    }
   }
-  if (unsendable.length > 0) {
-    await db
+
+  // ----------------------------------------------------------
+  // Mark recipients without valid phone as failed
+  // ----------------------------------------------------------
+
+  if (unsendableIds.length > 0) {
+    const {
+      error: unsendableError,
+    } = await db
       .from('broadcast_recipients')
       .update({
         status: 'failed',
-        error_message: 'No valid phone number on contact',
+        error_message:
+          'No valid phone number on contact',
       })
-      .in('id', unsendable);
+      .in('id', unsendableIds);
+
+    if (unsendableError) {
+      console.error(
+        '[broadcast-resume] failed to mark unsendable recipients:',
+        unsendableError.message
+      );
+    }
   }
 
-  const slice = sendable.slice(0, RESUME_MAX_PER_REQUEST);
-  const remaining = sendable.length - slice.length;
+  // ----------------------------------------------------------
+  // Apply resume cap
+  // ----------------------------------------------------------
+
+  const slice = sendable.slice(
+    0,
+    RESUME_MAX_PER_REQUEST
+  );
+
+  const remaining =
+    sendable.length - slice.length;
+
+  // ----------------------------------------------------------
+  // Nothing to send
+  // ----------------------------------------------------------
 
   if (slice.length === 0) {
     throw new BroadcastError(
@@ -205,12 +338,23 @@ export async function planBroadcastResume(
     );
   }
 
-  const { data: config, error: configError } = await db
+  // ----------------------------------------------------------
+  // WhatsApp configuration
+  // ----------------------------------------------------------
+
+  const {
+    data: config,
+    error: configError,
+  } = await db
     .from('whatsapp_config')
     .select('*')
     .eq('account_id', accountId)
     .single();
-  if (configError || !config) {
+
+  if (
+    configError ||
+    !config
+  ) {
     throw new BroadcastError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -218,13 +362,21 @@ export async function planBroadcastResume(
     );
   }
 
-  const resolvedTemplate = await resolveTemplateRow(
-    db,
-    accountId,
-    broadcast.template_name,
-    broadcast.template_language
-  );
-  if (resolvedTemplate.malformed) {
+  // ----------------------------------------------------------
+  // Resolve template
+  // ----------------------------------------------------------
+
+  const resolvedTemplate =
+    await resolveTemplateRow(
+      db,
+      accountId,
+      broadcast.template_name,
+      broadcast.template_language
+    );
+
+  if (
+    resolvedTemplate.malformed
+  ) {
     throw new BroadcastError(
       'template_malformed',
       'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before resuming.',
@@ -232,37 +384,113 @@ export async function planBroadcastResume(
     );
   }
 
+  // ----------------------------------------------------------
+  // Build BroadcastPlan
+  // ----------------------------------------------------------
+
   const plan: BroadcastPlan = {
     broadcastId,
-    templateName: broadcast.template_name,
-    templateLanguage: resolvedTemplate.language,
-    phoneNumberId: config.phone_number_id,
-    accessToken: decrypt(config.access_token),
-    templateRow: resolvedTemplate.row,
+
+    accountId,
+
+    auditUserId,
+
+    templateName:
+      broadcast.template_name,
+
+    templateLanguage:
+      resolvedTemplate.language,
+
+    phoneNumberId:
+      config.phone_number_id,
+
+    accessToken:
+      decrypt(config.access_token),
+
+    templateRow:
+      resolvedTemplate.row,
+
+    /**
+     * Preserve the campaign-level media URL that was frozen
+     * when the broadcast was originally created.
+     *
+     * This is important because a resume must reproduce the
+     * original campaign, not depend on whatever media URL may
+     * currently be configured on the template.
+     */
+    headerMediaUrl:
+      broadcast.header_media_url ?? null,
+
     planned: slice.map((row) => ({
-      recipientRowId: row.id,
-      phone: sanitizePhoneForMeta(contactPhone(row) ?? ''),
-      params: Array.isArray(row.template_params)
-        ? row.template_params.filter((p): p is string => typeof p === 'string')
-        : [],
+      recipientRowId:
+        row.id,
+
+      /**
+       * Preserve canonical contact identity so the delivery
+       * layer can resolve the same conversation relationship.
+       */
+      contactId:
+        row.contact_id,
+
+      phone:
+        sanitizePhoneForMeta(
+          contactPhone(row) ?? ''
+        ),
+
+      /**
+       * Migration 038 freezes the template parameters per
+       * recipient. This allows a resume to send exactly the
+       * same {{1}}, {{2}}, etc. values as the original pass.
+       */
+      params:
+        Array.isArray(row.template_params)
+          ? row.template_params.filter(
+              (
+                p
+              ): p is string =>
+                typeof p === 'string'
+            )
+          : [],
     })),
+
     rejected: 0,
   };
 
-  return { plan, remaining, unsendable: unsendable.length };
+  return {
+    plan,
+    remaining,
+    unsendable:
+      unsendableIds.length,
+  };
 }
 
-/**
- * Put the broadcast back into `sending` for the duration of the pass,
- * so the detail page reads as in-flight rather than as a finished
- * campaign that is quietly still working.
- */
+// ============================================================
+// Mark broadcast as sending
+// ============================================================
+
 export async function markBroadcastSending(
   db: SupabaseClient,
   broadcastId: string
 ): Promise<void> {
-  await db
+  const { error } = await db
     .from('broadcasts')
-    .update({ status: 'sending', updated_at: new Date().toISOString() })
+    .update({
+      status: 'sending',
+      updated_at:
+        new Date().toISOString(),
+    })
     .eq('id', broadcastId);
+
+  if (error) {
+    console.error(
+      '[broadcast-resume] failed to mark broadcast as sending:',
+      error.message
+    );
+
+    throw new BroadcastError(
+      'internal',
+      'Failed to mark broadcast as sending',
+      500
+    );
+  }
 }

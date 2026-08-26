@@ -53,47 +53,47 @@ import {
   blankButtonsPayload,
 } from "@/components/interactive/interactive-builder";
 import { validateInteractivePayload } from "@/lib/whatsapp/interactive";
-import type { InteractiveMessagePayload, QuickReply } from "@/types";
+import type {
+  InteractiveMessagePayload,
+  QuickReply,
+} from "@/types";
 import { QuickReplyPicker } from "./quick-reply-picker";
 
 /** Media content types an agent can send from the composer. */
-export type ComposerMediaKind = "image" | "video" | "document" | "audio";
+export type ComposerMediaKind =
+  | "image"
+  | "video"
+  | "document"
+  | "audio";
 
-/** Supabase Storage bucket holding agent-sent chat attachments (migration 023). */
+/** Supabase Storage bucket holding agent-sent chat attachments. */
 export const CHAT_MEDIA_BUCKET = "chat-media";
 
-/** Meta caps media captions at 1024 chars. Enforced here and in the send route. */
+/** Meta caps media captions at 1024 chars. */
 export const MEDIA_CAPTION_MAX = 1024;
 
-/** Hard cap on a single voice recording so it can't blow the upload/
- *  transcode limits — auto-stops the recorder when reached. */
+/** Hard cap on a single voice recording. */
 const MAX_RECORDING_SECONDS = 5 * 60;
 
 export interface SendMediaPayload {
   kind: ComposerMediaKind;
-  /** Public chat-media URL Meta fetches at send time. */
   mediaUrl: string;
-  /** Storage object path — lets the caller GC the object if the send fails. */
   path: string;
-  /** Optional caption (image/video/document only). */
   caption?: string;
-  /** Original file name — surfaced to the recipient for documents. */
   filename?: string;
   replyToId?: string;
 }
 
 interface ReplyDraft {
-  /** Internal UUID of the message being replied to — sent back through onSend. */
   id: string;
   authorLabel: string;
   preview: string;
 }
 
-// Mirrors the chat-media bucket's allowed_mime_types (migration 023) for
-// the file picker so unsupported files are rejected before upload rather
-// than failing with a confusing Storage error. Audio has no picker — it's
-// captured via the recorder.
-const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
+const PICKER_ACCEPT: Record<
+  "image" | "video" | "document",
+  string
+> = {
   image: "image/png,image/jpeg,image/webp",
   video: "video/mp4,video/3gpp",
   document:
@@ -103,7 +103,6 @@ const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
 interface MediaDraft {
   kind: ComposerMediaKind;
   mediaUrl: string;
-  /** Storage path — used to GC the object if the draft is discarded. */
   path: string;
   filename: string;
   caption: string;
@@ -114,7 +113,10 @@ interface MessageComposerProps {
   sessionExpired: boolean;
   onSend: (text: string, replyToId?: string) => void;
   onSendMedia: (payload: SendMediaPayload) => void;
-  onSendInteractive: (payload: InteractiveMessagePayload, replyToId?: string) => void;
+  onSendInteractive: (
+    payload: InteractiveMessagePayload,
+    replyToId?: string
+  ) => void;
   onOpenTemplates: () => void;
   replyTo?: ReplyDraft | null;
   onClearReply?: () => void;
@@ -123,13 +125,15 @@ interface MessageComposerProps {
 function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
+
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** Worker that encodes mic input to Ogg/Opus entirely in the browser
- *  (vendored from opus-recorder into /public). Recording client-side in a
- *  Meta-accepted format means no server ffmpeg / transcode step. */
-const OPUS_ENCODER_PATH = "/opus/encoderWorker.min.js";
+/**
+ * Worker que codifica o áudio do microfone em Ogg/Opus.
+ */
+const OPUS_ENCODER_PATH =
+  "/opus/encoderWorker.min.js";
 
 export function MessageComposer({
   conversationId,
@@ -146,51 +150,335 @@ export function MessageComposer({
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [drafting, setDrafting] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Interactive-message builder dialog + quick-reply picker.
-  const [interactiveOpen, setInteractiveOpen] = useState(false);
+  const textareaRef =
+    useRef<HTMLTextAreaElement>(null);
+
+  /*
+   * IMPORTANTE:
+   * readOnly precisa ser declarado antes dos useEffects
+   * que dependem dele.
+   */
+  const canSend = useCan("send-messages");
+  const readOnly = !canSend;
+
+  const inputsDisabled =
+    readOnly || sessionExpired;
+
+  // ------------------------------------------------------------------
+  // TEXTAREA
+  // ------------------------------------------------------------------
+
+  const adjustHeight = useCallback(() => {
+    const el = textareaRef.current;
+
+    if (!el) {
+      return;
+    }
+
+    el.style.height = "auto";
+
+    el.style.height = `${Math.min(
+      el.scrollHeight,
+      96
+    )}px`;
+  }, []);
+
+  // ------------------------------------------------------------------
+  // AUTO FOCUS AO TROCAR DE CONVERSA
+  // ------------------------------------------------------------------
+
+  useEffect(() => {
+    if (sessionExpired || readOnly) {
+      return;
+    }
+
+    let cancelled = false;
+
+    let frame1: number | null = null;
+    let frame2: number | null = null;
+    let frame3: number | null = null;
+
+    const focusComposer = () => {
+      if (cancelled) {
+        return;
+      }
+
+      const el = textareaRef.current;
+
+      if (!el) {
+        return;
+      }
+
+      if (el.disabled) {
+        return;
+      }
+
+      /*
+       * O foco precisa ser feito diretamente no elemento
+       * que está montado para a conversa atual.
+       */
+      el.focus();
+
+      const length = el.value.length;
+
+      try {
+        el.setSelectionRange(
+          length,
+          length
+        );
+      } catch {
+        // Alguns browsers podem bloquear seleção.
+      }
+    };
+
+    /*
+     * Usamos três frames porque a troca de conversa pode
+     * provocar mais de uma atualização/renderização antes
+     * do textarea estar pronto.
+     */
+    frame1 = requestAnimationFrame(() => {
+      frame2 = requestAnimationFrame(() => {
+        frame3 = requestAnimationFrame(() => {
+          focusComposer();
+        });
+      });
+    });
+
+    return () => {
+      cancelled = true;
+
+      if (frame1 !== null) {
+        cancelAnimationFrame(frame1);
+      }
+
+      if (frame2 !== null) {
+        cancelAnimationFrame(frame2);
+      }
+
+      if (frame3 !== null) {
+        cancelAnimationFrame(frame3);
+      }
+    };
+  }, [
+    conversationId,
+    sessionExpired,
+    readOnly,
+  ]);
+
+  // ------------------------------------------------------------------
+  // PERMITIR DIGITAR IMEDIATAMENTE APÓS SELECIONAR A CONVERSA
+  // ------------------------------------------------------------------
+  //
+  // Se o usuário selecionar uma conversa e começar a digitar
+  // antes do textarea receber o foco, capturamos a primeira
+  // tecla e direcionamos para o composer.
+  //
+  // Isso elimina a necessidade de clicar no campo de mensagem.
+  // ------------------------------------------------------------------
+
+  useEffect(() => {
+    if (sessionExpired || readOnly) {
+      return;
+    }
+
+    const handleGlobalKeyDown = (
+      e: globalThis.KeyboardEvent
+    ) => {
+      const target =
+        e.target as HTMLElement | null;
+
+      if (!target) {
+        return;
+      }
+
+      /*
+       * Se o usuário já está digitando em outro campo
+       * editável, não interferimos.
+       */
+      const isEditable =
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT" ||
+        target.isContentEditable;
+
+      if (isEditable) {
+        return;
+      }
+
+      /*
+       * Não interferir em atalhos como:
+       * Ctrl + alguma tecla
+       * Cmd + alguma tecla
+       * Alt + alguma tecla
+       */
+      if (
+        e.ctrlKey ||
+        e.metaKey ||
+        e.altKey
+      ) {
+        return;
+      }
+
+      /*
+       * Apenas caracteres reais.
+       *
+       * Backspace, Enter, setas, Escape etc. continuam
+       * sendo tratados normalmente pela aplicação.
+       */
+      if (e.key.length !== 1) {
+        return;
+      }
+
+      const el = textareaRef.current;
+
+      if (!el || el.disabled) {
+        return;
+      }
+
+      /*
+       * Impede a tecla de ser processada pelo elemento
+       * atualmente focado.
+       */
+      e.preventDefault();
+
+      /*
+       * Coloca o foco no composer.
+       */
+      el.focus();
+
+      /*
+       * Adiciona a primeira tecla diretamente ao estado.
+       */
+      setText(
+        (prev) => prev + e.key
+      );
+
+      /*
+       * Ajusta altura e posiciona cursor no final.
+       */
+      requestAnimationFrame(() => {
+        adjustHeight();
+
+        const current =
+          textareaRef.current;
+
+        if (!current) {
+          return;
+        }
+
+        current.focus();
+
+        const length =
+          current.value.length;
+
+        try {
+          current.setSelectionRange(
+            length,
+            length
+          );
+        } catch {
+          // Ignora browsers sem suporte.
+        }
+      });
+    };
+
+    window.addEventListener(
+      "keydown",
+      handleGlobalKeyDown
+    );
+
+    return () => {
+      window.removeEventListener(
+        "keydown",
+        handleGlobalKeyDown
+      );
+    };
+  }, [
+    sessionExpired,
+    readOnly,
+    adjustHeight,
+  ]);
+
+  // ------------------------------------------------------------------
+  // INTERACTIVE MESSAGE
+  // ------------------------------------------------------------------
+
+  const [interactiveOpen, setInteractiveOpen] =
+    useState(false);
+
   const [interactivePayload, setInteractivePayload] =
-    useState<InteractiveMessagePayload>(blankButtonsPayload);
-  const [savingQuickReply, setSavingQuickReply] = useState(false);
-  const [quickReplyOpen, setQuickReplyOpen] = useState(false);
+    useState<InteractiveMessagePayload>(
+      blankButtonsPayload
+    );
 
-  // Media attachment state. `draft` holds an uploaded-but-not-yet-sent
-  // attachment; `busy` covers the upload/transcode window.
-  const [draft, setDraft] = useState<MediaDraft | null>(null);
+  const [savingQuickReply, setSavingQuickReply] =
+    useState(false);
+
+  const [quickReplyOpen, setQuickReplyOpen] =
+    useState(false);
+
+  // ------------------------------------------------------------------
+  // MEDIA
+  // ------------------------------------------------------------------
+
+  const [draft, setDraft] =
+    useState<MediaDraft | null>(null);
+
   const [busy, setBusy] = useState(false);
-  const imageInputRef = useRef<HTMLInputElement>(null);
-  const videoInputRef = useRef<HTMLInputElement>(null);
-  const documentInputRef = useRef<HTMLInputElement>(null);
-  // Mirror of `draft` for the unmount cleanup, which can't read render
-  // state. Kept in sync below so navigating away with a staged-but-unsent
-  // attachment GCs the orphaned object.
-  const draftRef = useRef<MediaDraft | null>(null);
+
+  const imageInputRef =
+    useRef<HTMLInputElement>(null);
+
+  const videoInputRef =
+    useRef<HTMLInputElement>(null);
+
+  const documentInputRef =
+    useRef<HTMLInputElement>(null);
+
+  const draftRef =
+    useRef<MediaDraft | null>(null);
+
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
 
-  // Best-effort GC of a staged object the user never sent. Fire-and-forget.
-  const removeStaged = useCallback((path: string | undefined) => {
-    if (!path) return;
-    void deleteAccountMedia(CHAT_MEDIA_BUCKET, path).catch(() => {});
-  }, []);
+  const removeStaged = useCallback(
+    (path: string | undefined) => {
+      if (!path) {
+        return;
+      }
 
-  // Voice recording state. The recorder encodes Ogg/Opus in-browser
-  // (opus-recorder) so there's no server-side transcode.
-  const [recording, setRecording] = useState(false);
-  const [recordSeconds, setRecordSeconds] = useState(0);
-  const recorderRef = useRef<import("opus-recorder").default | null>(null);
-  const cancelledRef = useRef(false);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+      void deleteAccountMedia(
+        CHAT_MEDIA_BUCKET,
+        path
+      ).catch(() => {});
+    },
+    []
+  );
 
-  // Viewers (read-only role) can browse the inbox but never send.
-  // For solo users this is always true — single-owner accounts pass
-  // every capability — so the disabled branch is a no-op there.
-  const canSend = useCan("send-messages");
-  const readOnly = !canSend;
-  // Media (like free-form text) is only allowed inside the 24h window.
-  const inputsDisabled = readOnly || sessionExpired;
+  // ------------------------------------------------------------------
+  // VOICE RECORDING
+  // ------------------------------------------------------------------
+
+  const [recording, setRecording] =
+    useState(false);
+
+  const [recordSeconds, setRecordSeconds] =
+    useState(0);
+
+  const recorderRef =
+    useRef<
+      import("opus-recorder").default | null
+    >(null);
+
+  const cancelledRef =
+    useRef(false);
+
+  const timerRef =
+    useRef<ReturnType<typeof setInterval> | null>(
+      null
+    );
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -199,398 +487,840 @@ export function MessageComposer({
     }
   }, []);
 
-  // Tear down any live recording + timer on unmount so a mid-record
-  // navigation doesn't leak the mic, and GC a staged-but-unsent
-  // attachment so it doesn't orphan in the bucket.
+  // ------------------------------------------------------------------
+  // CLEANUP
+  // ------------------------------------------------------------------
+
   useEffect(() => {
     return () => {
       clearTimer();
+
       cancelledRef.current = true;
-      // stop() releases the mic stream + audio context inside opus-recorder.
-      void recorderRef.current?.stop().catch(() => {});
-      removeStaged(draftRef.current?.path);
+
+      void recorderRef.current
+        ?.stop()
+        .catch(() => {});
+
+      removeStaged(
+        draftRef.current?.path
+      );
     };
-  }, [clearTimer, removeStaged]);
+  }, [
+    clearTimer,
+    removeStaged,
+  ]);
 
-  const adjustHeight = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    // Max 4 lines (~96px)
-    el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
-  }, []);
+  // ------------------------------------------------------------------
+  // SEND TEXT
+  // ------------------------------------------------------------------
 
-  const handleSend = useCallback(async () => {
-    const trimmed = text.trim();
-    if (!trimmed || sending || sessionExpired) return;
+  const handleSend = useCallback(
+    async () => {
+      const trimmed = text.trim();
 
-    setSending(true);
-    try {
-      onSend(trimmed, replyTo?.id);
-      setText("");
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
+      if (
+        !trimmed ||
+        sending ||
+        sessionExpired ||
+        readOnly
+      ) {
+        return;
       }
-    } finally {
-      setSending(false);
-    }
-  }, [text, sending, sessionExpired, onSend, replyTo?.id]);
+
+      setSending(true);
+
+      try {
+        onSend(
+          trimmed,
+          replyTo?.id
+        );
+
+        setText("");
+
+        if (textareaRef.current) {
+          textareaRef.current.style.height =
+            "auto";
+
+          /*
+           * Mantém o foco depois do envio para permitir
+           * digitação contínua sem clicar novamente.
+           */
+          requestAnimationFrame(() => {
+            textareaRef.current?.focus();
+          });
+        }
+      } finally {
+        setSending(false);
+      }
+    },
+    [
+      text,
+      sending,
+      sessionExpired,
+      readOnly,
+      onSend,
+      replyTo?.id,
+    ]
+  );
 
   const handleKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
+    (
+      e: KeyboardEvent<HTMLTextAreaElement>
+    ) => {
+      if (
+        e.key === "Enter" &&
+        !e.shiftKey
+      ) {
         e.preventDefault();
-        handleSend();
+
+        void handleSend();
       }
     },
     [handleSend]
   );
 
   const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    (
+      e: React.ChangeEvent<HTMLTextAreaElement>
+    ) => {
       setText(e.target.value);
+
       adjustHeight();
     },
     [adjustHeight]
   );
 
-  // Ask the AI assistant for a suggested reply and drop it into the
-  // composer for the agent to edit + send. Read-only server-side —
-  // nothing is sent until the agent hits Send.
-  const handleDraft = useCallback(async () => {
-    if (drafting) return;
-    setDrafting(true);
-    try {
-      const res = await fetch("/api/ai/draft", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversation_id: conversationId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (data.code === "ai_not_configured") {
-          toast.error("AI isn't set up yet — enable it in Settings → AI Assistant.");
-        } else {
-          toast.error(data.error ?? "Couldn't draft a reply.");
-        }
+  // ------------------------------------------------------------------
+  // AI DRAFT
+  // ------------------------------------------------------------------
+
+  const handleDraft = useCallback(
+    async () => {
+      if (
+        drafting ||
+        readOnly ||
+        sessionExpired
+      ) {
         return;
       }
-      const draftText = typeof data.draft === "string" ? data.draft.trim() : "";
-      if (!draftText) {
-        toast.error("The assistant didn't return a reply.");
-        return;
-      }
-      setText(draftText);
-      // Let the textarea grow to fit and drop the cursor at the end so
-      // the agent can tweak immediately.
-      requestAnimationFrame(() => {
-        adjustHeight();
-        const el = textareaRef.current;
-        if (el) {
-          el.focus();
-          el.setSelectionRange(el.value.length, el.value.length);
+
+      setDrafting(true);
+
+      try {
+        const res = await fetch(
+          "/api/ai/draft",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+            body: JSON.stringify({
+              conversation_id:
+                conversationId,
+            }),
+          }
+        );
+
+        const data =
+          await res
+            .json()
+            .catch(() => ({}));
+
+        if (!res.ok) {
+          if (
+            data.code ===
+            "ai_not_configured"
+          ) {
+            toast.error(
+              "AI isn't set up yet — enable it in Settings → AI Assistant."
+            );
+          } else {
+            toast.error(
+              data.error ??
+                "Couldn't draft a reply."
+            );
+          }
+
+          return;
         }
-      });
-    } catch {
-      toast.error("Couldn't reach the AI assistant.");
-    } finally {
-      setDrafting(false);
-    }
-  }, [drafting, conversationId, adjustHeight]);
 
-  // ---- Interactive message + quick replies --------------------------
+        const draftText =
+          typeof data.draft ===
+          "string"
+            ? data.draft.trim()
+            : "";
 
-  const openInteractiveBuilder = useCallback(
-    (seed?: InteractiveMessagePayload) => {
-      setInteractivePayload(seed ?? blankButtonsPayload());
-      setInteractiveOpen(true);
+        if (!draftText) {
+          toast.error(
+            "The assistant didn't return a reply."
+          );
+
+          return;
+        }
+
+        setText(draftText);
+
+        requestAnimationFrame(() => {
+          adjustHeight();
+
+          const el =
+            textareaRef.current;
+
+          if (el) {
+            el.focus();
+
+            el.setSelectionRange(
+              el.value.length,
+              el.value.length
+            );
+          }
+        });
+      } catch {
+        toast.error(
+          "Couldn't reach the AI assistant."
+        );
+      } finally {
+        setDrafting(false);
+      }
     },
-    [],
+    [
+      drafting,
+      readOnly,
+      sessionExpired,
+      conversationId,
+      adjustHeight,
+    ]
   );
 
-  const sendInteractive = useCallback(() => {
-    const result = validateInteractivePayload(interactivePayload);
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
-    }
-    onSendInteractive(interactivePayload, replyTo?.id);
-    setInteractiveOpen(false);
-    onClearReply?.();
-  }, [interactivePayload, onSendInteractive, replyTo?.id, onClearReply]);
+  // ------------------------------------------------------------------
+  // INTERACTIVE + QUICK REPLIES
+  // ------------------------------------------------------------------
 
-  // Persist the current builder payload as a reusable interactive snippet.
-  const saveAsQuickReply = useCallback(async () => {
-    const result = validateInteractivePayload(interactivePayload);
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
-    }
-    const title = window
-      .prompt(t("quickReplyNamePrompt"))
-      ?.trim();
-    if (!title) return;
-    setSavingQuickReply(true);
-    try {
-      const res = await fetch("/api/quick-replies", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title,
-          kind: "interactive",
-          interactive_payload: interactivePayload,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        toast.error(data.error ?? t("quickReplySaveError"));
+  const openInteractiveBuilder =
+    useCallback(
+      (
+        seed?: InteractiveMessagePayload
+      ) => {
+        setInteractivePayload(
+          seed ??
+            blankButtonsPayload()
+        );
+
+        setInteractiveOpen(true);
+      },
+      []
+    );
+
+  const sendInteractive =
+    useCallback(() => {
+      if (readOnly) {
         return;
       }
-      toast.success(t("quickReplySaved"));
-    } catch {
-      toast.error(t("quickReplySaveError"));
-    } finally {
-      setSavingQuickReply(false);
-    }
-  }, [interactivePayload, t]);
 
-  // A picked quick reply: text fills the composer; interactive opens the
-  // builder pre-filled so the agent can tweak before sending.
-  const handlePickQuickReply = useCallback(
-    (qr: QuickReply) => {
-      setQuickReplyOpen(false);
-      if (qr.kind === "interactive" && qr.interactive_payload) {
-        openInteractiveBuilder(qr.interactive_payload);
+      const result =
+        validateInteractivePayload(
+          interactivePayload
+        );
+
+      if (!result.ok) {
+        toast.error(result.error);
         return;
       }
-      const body = qr.content_text ?? "";
-      // Separate the snippet from any existing draft with a newline so the
-      // words don't run together ("Thanks" + "we'll…" → "Thankswe'll…").
-      setText((prev) =>
-        prev && !/\s$/.test(prev) ? `${prev}\n${body}` : `${prev}${body}`,
+
+      onSendInteractive(
+        interactivePayload,
+        replyTo?.id
       );
-      requestAnimationFrame(() => {
-        adjustHeight();
-        const el = textareaRef.current;
-        if (el) {
-          el.focus();
-          el.setSelectionRange(el.value.length, el.value.length);
-        }
-      });
-    },
-    [openInteractiveBuilder, adjustHeight],
-  );
 
-  // Upload a captured file to chat-media and stage it as a draft.
+      setInteractiveOpen(false);
+
+      onClearReply?.();
+    }, [
+      readOnly,
+      interactivePayload,
+      onSendInteractive,
+      replyTo?.id,
+      onClearReply,
+    ]);
+
+  const saveAsQuickReply =
+    useCallback(async () => {
+      const result =
+        validateInteractivePayload(
+          interactivePayload
+        );
+
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+
+      const title =
+        window
+          .prompt(
+            t("quickReplyNamePrompt")
+          )
+          ?.trim();
+
+      if (!title) {
+        return;
+      }
+
+      setSavingQuickReply(true);
+
+      try {
+        const res =
+          await fetch(
+            "/api/quick-replies",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+              },
+              body: JSON.stringify({
+                title,
+                kind: "interactive",
+                interactive_payload:
+                  interactivePayload,
+              }),
+            }
+          );
+
+        const data =
+          await res
+            .json()
+            .catch(() => ({}));
+
+        if (!res.ok) {
+          toast.error(
+            data.error ??
+              t(
+                "quickReplySaveError"
+              )
+          );
+
+          return;
+        }
+
+        toast.success(
+          t("quickReplySaved")
+        );
+      } catch {
+        toast.error(
+          t("quickReplySaveError")
+        );
+      } finally {
+        setSavingQuickReply(false);
+      }
+    }, [
+      interactivePayload,
+      t,
+    ]);
+
+  const handlePickQuickReply =
+    useCallback(
+      (qr: QuickReply) => {
+        setQuickReplyOpen(false);
+
+        if (
+          qr.kind ===
+            "interactive" &&
+          qr.interactive_payload
+        ) {
+          openInteractiveBuilder(
+            qr.interactive_payload
+          );
+
+          return;
+        }
+
+        const body =
+          qr.content_text ?? "";
+
+        setText((prev) =>
+          prev &&
+          !/\s$/.test(prev)
+            ? `${prev}\n${body}`
+            : `${prev}${body}`
+        );
+
+        requestAnimationFrame(() => {
+          adjustHeight();
+
+          const el =
+            textareaRef.current;
+
+          if (el) {
+            el.focus();
+
+            el.setSelectionRange(
+              el.value.length,
+              el.value.length
+            );
+          }
+        });
+      },
+      [
+        openInteractiveBuilder,
+        adjustHeight,
+      ]
+    );
+
+  // ------------------------------------------------------------------
+  // MEDIA UPLOAD
+  // ------------------------------------------------------------------
+
   const stageUpload = useCallback(
-    async (kind: ComposerMediaKind, file: File) => {
-      // Per-kind ceiling mirrors Meta's caps (image 5 MB, etc.) so we
-      // reject before upload rather than orphaning an object that Meta
-      // would then refuse at send.
-      const max = MEDIA_MAX_BYTES_BY_KIND[kind];
+    async (
+      kind: ComposerMediaKind,
+      file: File
+    ) => {
+      const max =
+        MEDIA_MAX_BYTES_BY_KIND[
+          kind
+        ];
+
       if (file.size > max) {
         toast.error(
-          `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — ${kind} limit is ${Math.round(
-            max / 1024 / 1024,
-          )} MB.`,
+          `File is ${(
+            file.size /
+            1024 /
+            1024
+          ).toFixed(
+            1
+          )} MB — ${kind} limit is ${Math.round(
+            max /
+              1024 /
+              1024
+          )} MB.`
         );
+
         return;
       }
+
       setBusy(true);
+
       try {
-        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        // Replacing an existing draft? GC the previous object first.
-        removeStaged(draftRef.current?.path);
-        setDraft({ kind, mediaUrl: publicUrl, path, filename: file.name, caption: "" });
+        const {
+          publicUrl,
+          path,
+        } =
+          await uploadAccountMedia(
+            CHAT_MEDIA_BUCKET,
+            file
+          );
+
+        removeStaged(
+          draftRef.current?.path
+        );
+
+        setDraft({
+          kind,
+          mediaUrl: publicUrl,
+          path,
+          filename: file.name,
+          caption: "",
+        });
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Upload failed.");
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : "Upload failed."
+        );
       } finally {
         setBusy(false);
       }
     },
-    [removeStaged],
+    [removeStaged]
   );
 
-  const handlePicked = useCallback(
-    (kind: "image" | "video" | "document", file: File | undefined) => {
-      if (file) void stageUpload(kind, file);
-    },
-    [stageUpload],
-  );
+  const handlePicked =
+    useCallback(
+      (
+        kind:
+          | "image"
+          | "video"
+          | "document",
+        file:
+          | File
+          | undefined
+      ) => {
+        if (file) {
+          void stageUpload(
+            kind,
+            file
+          );
+        }
+      },
+      [stageUpload]
+    );
 
-  // ---- Voice recording (client-side Ogg/Opus, no server transcode) ---
+  // ------------------------------------------------------------------
+  // VOICE RECORDING
+  // ------------------------------------------------------------------
 
-  // The encoded Ogg/Opus file from opus-recorder → upload as an audio
-  // draft. WhatsApp renders Ogg/Opus as a playable voice note.
-  const finalizeRecording = useCallback(
-    async (bytes: Uint8Array) => {
-      // Uint8Array is a valid BlobPart at runtime; the cast sidesteps the
-      // lib.dom ArrayBufferLike-vs-ArrayBuffer generic mismatch.
-      const file = new File([bytes as unknown as BlobPart], `voice-${Date.now()}.ogg`, {
-        type: "audio/ogg",
-      });
-      if (file.size === 0) return; // cancelled / empty take
-      if (file.size > MEDIA_MAX_BYTES_BY_KIND.audio) {
-        toast.error("Recording is too long (over 16 MB).");
+  const finalizeRecording =
+    useCallback(
+      async (bytes: Uint8Array) => {
+        const file =
+          new File(
+            [
+              bytes as unknown as BlobPart,
+            ],
+            `voice-${Date.now()}.ogg`,
+            {
+              type: "audio/ogg",
+            }
+          );
+
+        if (file.size === 0) {
+          return;
+        }
+
+        if (
+          file.size >
+          MEDIA_MAX_BYTES_BY_KIND
+            .audio
+        ) {
+          toast.error(
+            "Recording is too long (over 16 MB)."
+          );
+
+          return;
+        }
+
+        setBusy(true);
+
+        try {
+          const {
+            publicUrl,
+            path,
+          } =
+            await uploadAccountMedia(
+              CHAT_MEDIA_BUCKET,
+              file
+            );
+
+          removeStaged(
+            draftRef.current?.path
+          );
+
+          setDraft({
+            kind: "audio",
+            mediaUrl: publicUrl,
+            path,
+            filename:
+              file.name,
+            caption: "",
+          });
+        } catch (err) {
+          toast.error(
+            err instanceof Error
+              ? err.message
+              : "Upload failed."
+          );
+        } finally {
+          setBusy(false);
+        }
+      },
+      [removeStaged]
+    );
+
+  const startRecording =
+    useCallback(async () => {
+      if (
+        inputsDisabled ||
+        busy ||
+        recording
+      ) {
         return;
       }
-      setBusy(true);
-      try {
-        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        removeStaged(draftRef.current?.path);
-        setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : "Upload failed.");
-      } finally {
-        setBusy(false);
+
+      if (
+        !navigator.mediaDevices
+          ?.getUserMedia ||
+        typeof AudioContext ===
+          "undefined"
+      ) {
+        toast.error(
+          "Voice recording isn't supported in this browser."
+        );
+
+        return;
       }
-    },
-    [removeStaged],
-  );
 
-  const startRecording = useCallback(async () => {
-    if (inputsDisabled || busy || recording) return;
-    if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
-      toast.error("Voice recording isn't supported in this browser.");
-      return;
-    }
-    try {
-      // Lazy-load the encoder (≈400 KB worker) only when the user records,
-      // keeping it out of the main bundle.
-      const { default: Recorder } = await import("opus-recorder");
-      const recorder = new Recorder({
-        encoderPath: OPUS_ENCODER_PATH,
-        numberOfChannels: 1,
-        encoderApplication: 2048, // VOIP — tuned for speech
-        encoderSampleRate: 48000,
-        streamPages: false, // one callback with the complete file on stop
-      });
-      cancelledRef.current = false;
-      recorder.ondataavailable = (bytes) => {
-        if (cancelledRef.current) return;
-        void finalizeRecording(bytes);
-      };
-      recorderRef.current = recorder;
-      await recorder.start();
-      setRecording(true);
-      setRecordSeconds(0);
-      timerRef.current = setInterval(() => setRecordSeconds((s) => s + 1), 1000);
-    } catch {
-      void recorderRef.current?.stop().catch(() => {});
-      recorderRef.current = null;
-      toast.error("Microphone access denied or unavailable.");
-    }
-  }, [inputsDisabled, busy, recording, finalizeRecording]);
+      try {
+        const {
+          default: Recorder,
+        } =
+          await import(
+            "opus-recorder"
+          );
 
-  const stopRecording = useCallback(() => {
-    clearTimer();
-    setRecording(false);
-    void recorderRef.current?.stop().catch(() => {});
-  }, [clearTimer]);
+        const recorder =
+          new Recorder({
+            encoderPath:
+              OPUS_ENCODER_PATH,
+            numberOfChannels: 1,
+            encoderApplication: 2048,
+            encoderSampleRate: 48000,
+            streamPages: false,
+          });
 
-  const cancelRecording = useCallback(() => {
-    cancelledRef.current = true;
-    clearTimer();
-    setRecording(false);
-    void recorderRef.current?.stop().catch(() => {});
-  }, [clearTimer]);
+        cancelledRef.current =
+          false;
 
-  // Auto-stop at the cap so a forgotten recording can't blow the
-  // upload size limit.
+        recorder.ondataavailable =
+          (bytes) => {
+            if (
+              cancelledRef.current
+            ) {
+              return;
+            }
+
+            void finalizeRecording(
+              bytes
+            );
+          };
+
+        recorderRef.current =
+          recorder;
+
+        await recorder.start();
+
+        setRecording(true);
+
+        setRecordSeconds(0);
+
+        timerRef.current =
+          setInterval(() => {
+            setRecordSeconds(
+              (s) => s + 1
+            );
+          }, 1000);
+      } catch {
+        void recorderRef.current
+          ?.stop()
+          .catch(() => {});
+
+        recorderRef.current =
+          null;
+
+        toast.error(
+          "Microphone access denied or unavailable."
+        );
+      }
+    }, [
+      inputsDisabled,
+      busy,
+      recording,
+      finalizeRecording,
+    ]);
+
+  const stopRecording =
+    useCallback(() => {
+      clearTimer();
+
+      setRecording(false);
+
+      void recorderRef.current
+        ?.stop()
+        .catch(() => {});
+    }, [clearTimer]);
+
+  const cancelRecording =
+    useCallback(() => {
+      cancelledRef.current =
+        true;
+
+      clearTimer();
+
+      setRecording(false);
+
+      void recorderRef.current
+        ?.stop()
+        .catch(() => {});
+    }, [clearTimer]);
+
   useEffect(() => {
-    if (recording && recordSeconds >= MAX_RECORDING_SECONDS) {
+    if (
+      recording &&
+      recordSeconds >=
+        MAX_RECORDING_SECONDS
+    ) {
       stopRecording();
     }
-  }, [recording, recordSeconds, stopRecording]);
+  }, [
+    recording,
+    recordSeconds,
+    stopRecording,
+  ]);
 
-  // ---- Draft send / discard -----------------------------------------
+  // ------------------------------------------------------------------
+  // SEND / DISCARD MEDIA
+  // ------------------------------------------------------------------
 
   const sendDraft = useCallback(() => {
-    if (!draft || busy) return;
+    if (
+      !draft ||
+      busy ||
+      readOnly
+    ) {
+      return;
+    }
+
     onSendMedia({
       kind: draft.kind,
       mediaUrl: draft.mediaUrl,
       path: draft.path,
-      // Audio takes no caption (Meta rejects it). Everything else: the
-      // trimmed caption, or undefined when blank.
       caption:
-        draft.kind === "audio" ? undefined : draft.caption.trim() || undefined,
-      filename: draft.kind === "document" ? draft.filename : undefined,
+        draft.kind === "audio"
+          ? undefined
+          : draft.caption.trim() ||
+            undefined,
+      filename:
+        draft.kind ===
+        "document"
+          ? draft.filename
+          : undefined,
       replyToId: replyTo?.id,
     });
-    // The object is now owned by the sent message — clear without GC.
+
     setDraft(null);
+
     onClearReply?.();
-  }, [draft, busy, onSendMedia, replyTo?.id, onClearReply]);
+  }, [
+    draft,
+    busy,
+    readOnly,
+    onSendMedia,
+    replyTo?.id,
+    onClearReply,
+  ]);
 
-  // Discard GCs the staged object — it was uploaded but never sent.
-  const discardDraft = useCallback(() => {
-    removeStaged(draft?.path);
-    setDraft(null);
-  }, [draft?.path, removeStaged]);
+  const discardDraft =
+    useCallback(() => {
+      removeStaged(
+        draft?.path
+      );
 
-  const setCaption = useCallback((caption: string) => {
-    setDraft((d) => (d ? { ...d, caption } : d));
-  }, []);
+      setDraft(null);
+    }, [
+      draft?.path,
+      removeStaged,
+    ]);
 
-  // ---- Render --------------------------------------------------------
+  const setCaption =
+    useCallback(
+      (caption: string) => {
+        setDraft((d) =>
+          d
+            ? {
+                ...d,
+                caption,
+              }
+            : d
+        );
+      },
+      []
+    );
+
+  // ------------------------------------------------------------------
+  // RENDER
+  // ------------------------------------------------------------------
 
   return (
     <div className="border-t border-border bg-card p-3">
       {replyTo && (
         <div className="mb-2">
           <ReplyQuote
-            authorLabel={replyTo.authorLabel}
-            preview={replyTo.preview}
-            onDismiss={onClearReply}
+            authorLabel={
+              replyTo.authorLabel
+            }
+            preview={
+              replyTo.preview
+            }
+            onDismiss={
+              onClearReply
+            }
           />
         </div>
       )}
+
       {sessionExpired && (
         <div className="mb-2 flex items-center justify-between rounded-lg bg-amber-500/10 px-3 py-2">
           <p className="text-xs text-amber-400">
-            {t("sessionExpiredHint")}
+            {t(
+              "sessionExpiredHint"
+            )}
           </p>
+
           <Button
             variant="ghost"
             size="sm"
             className="h-7 text-xs text-amber-400 hover:text-amber-300"
-            onClick={onOpenTemplates}
+            onClick={
+              onOpenTemplates
+            }
           >
             <LayoutTemplate className="mr-1 h-3 w-3" />
+
             {t("templates")}
           </Button>
         </div>
       )}
 
-      {/* Hidden file inputs driven by the attach menu. */}
+      {/* Hidden file inputs */}
+
       <input
         ref={imageInputRef}
         type="file"
-        accept={PICKER_ACCEPT.image}
+        accept={
+          PICKER_ACCEPT.image
+        }
         className="hidden"
         onChange={(e) => {
-          handlePicked("image", e.target.files?.[0]);
+          handlePicked(
+            "image",
+            e.target.files?.[0]
+          );
+
           e.target.value = "";
         }}
       />
+
       <input
         ref={videoInputRef}
         type="file"
-        accept={PICKER_ACCEPT.video}
+        accept={
+          PICKER_ACCEPT.video
+        }
         className="hidden"
         onChange={(e) => {
-          handlePicked("video", e.target.files?.[0]);
+          handlePicked(
+            "video",
+            e.target.files?.[0]
+          );
+
           e.target.value = "";
         }}
       />
+
       <input
         ref={documentInputRef}
         type="file"
-        accept={PICKER_ACCEPT.document}
+        accept={
+          PICKER_ACCEPT.document
+        }
         className="hidden"
         onChange={(e) => {
-          handlePicked("document", e.target.files?.[0]);
+          handlePicked(
+            "document",
+            e.target.files?.[0]
+          );
+
           e.target.value = "";
         }}
       />
@@ -600,46 +1330,75 @@ export function MessageComposer({
           draft={draft}
           busy={busy}
           readOnly={readOnly}
-          onCaptionChange={setCaption}
-          onDiscard={discardDraft}
+          onCaptionChange={
+            setCaption
+          }
+          onDiscard={
+            discardDraft
+          }
           onSend={sendDraft}
           t={t}
         />
       ) : recording ? (
-        // Recording bar — replaces the composer while the mic is live.
         <div className="flex items-center gap-3 rounded-xl border border-border bg-muted px-4 py-2.5">
           <span className="flex h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
+
           <span className="flex-1 text-sm text-foreground">
-            {t("recording", { current: formatDuration(recordSeconds), max: formatDuration(MAX_RECORDING_SECONDS) })}
+            {t("recording", {
+              current:
+                formatDuration(
+                  recordSeconds
+                ),
+              max:
+                formatDuration(
+                  MAX_RECORDING_SECONDS
+                ),
+            })}
           </span>
+
           <button
             type="button"
-            onClick={cancelRecording}
+            onClick={
+              cancelRecording
+            }
             className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-card hover:text-foreground"
           >
             {t("cancel")}
           </button>
+
           <Button
             size="sm"
-            onClick={stopRecording}
+            onClick={
+              stopRecording
+            }
             className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90"
-            title={t("stopAndAttach")}
+            title={t(
+              "stopAndAttach"
+            )}
           >
             <Square className="h-4 w-4" />
           </Button>
         </div>
       ) : (
         <div className="flex items-end gap-2">
-          {/* Attach menu — photo / video / document / voice. */}
+          {/* Attach menu */}
+
           <DropdownMenu>
             <DropdownMenuTrigger
-              disabled={inputsDisabled || busy}
+              disabled={
+                inputsDisabled ||
+                busy
+              }
               title={
                 readOnly
-                  ? t("readOnlyTitle")
+                  ? t(
+                      "readOnlyTitle"
+                    )
                   : inputsDisabled
                     ? undefined
-                    : t("attachMedia")
+                    : t(
+                        "attachMedia"
+                      )
               }
               className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -649,50 +1408,104 @@ export function MessageComposer({
                 <Paperclip className="h-4 w-4" />
               )}
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="border-border bg-popover">
-              <DropdownMenuItem onClick={() => imageInputRef.current?.click()}>
+
+            <DropdownMenuContent
+              align="start"
+              className="border-border bg-popover"
+            >
+              <DropdownMenuItem
+                onClick={() =>
+                  imageInputRef.current?.click()
+                }
+              >
                 <ImageIcon className="mr-2 h-4 w-4" />
+
                 {t("photo")}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => videoInputRef.current?.click()}>
+
+              <DropdownMenuItem
+                onClick={() =>
+                  videoInputRef.current?.click()
+                }
+              >
                 <Video className="mr-2 h-4 w-4" />
+
                 {t("video")}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => documentInputRef.current?.click()}>
+
+              <DropdownMenuItem
+                onClick={() =>
+                  documentInputRef.current?.click()
+                }
+              >
                 <FileText className="mr-2 h-4 w-4" />
+
                 {t("document")}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void startRecording()}>
+
+              <DropdownMenuItem
+                onClick={() =>
+                  void startRecording()
+                }
+              >
                 <Mic className="mr-2 h-4 w-4" />
+
                 {t("voiceNote")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* + menu — interactive messages + quick replies. Gated on the
-              24h window like free-form text (interactive requires it). */}
+          {/* + menu */}
+
           <DropdownMenu>
             <DropdownMenuTrigger
-              disabled={inputsDisabled}
+              disabled={
+                inputsDisabled
+              }
               title={
                 readOnly
-                  ? t("readOnlyTitle")
+                  ? t(
+                      "readOnlyTitle"
+                    )
                   : inputsDisabled
                     ? undefined
-                    : t("moreActions")
+                    : t(
+                        "moreActions"
+                      )
               }
               className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md p-0 text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Plus className="h-4 w-4" />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="border-border bg-popover">
-              <DropdownMenuItem onClick={() => openInteractiveBuilder()}>
+
+            <DropdownMenuContent
+              align="start"
+              className="border-border bg-popover"
+            >
+              <DropdownMenuItem
+                onClick={() =>
+                  openInteractiveBuilder()
+                }
+              >
                 <MessageSquareDashed className="mr-2 h-4 w-4" />
-                {t("interactiveMessage")}
+
+                {t(
+                  "interactiveMessage"
+                )}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => setQuickReplyOpen(true)}>
+
+              <DropdownMenuItem
+                onClick={() =>
+                  setQuickReplyOpen(
+                    true
+                  )
+                }
+              >
                 <Zap className="mr-2 h-4 w-4" />
-                {t("quickReplies")}
+
+                {t(
+                  "quickReplies"
+                )}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -702,9 +1515,17 @@ export function MessageComposer({
             size="sm"
             canAct={!readOnly}
             gateReason="send messages"
-            title={readOnly ? undefined : t("sendTemplate")}
+            title={
+              readOnly
+                ? undefined
+                : t(
+                    "sendTemplate"
+                  )
+            }
             className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-foreground"
-            onClick={onOpenTemplates}
+            onClick={
+              onOpenTemplates
+            }
           >
             <LayoutTemplate className="h-4 w-4" />
           </GatedButton>
@@ -715,9 +1536,17 @@ export function MessageComposer({
             canAct={!readOnly}
             gateReason="send messages"
             disabled={drafting}
-            title={readOnly ? undefined : t("draftWithAI")}
+            title={
+              readOnly
+                ? undefined
+                : t(
+                    "draftWithAI"
+                  )
+            }
             className="h-9 w-9 shrink-0 p-0 text-muted-foreground hover:text-primary"
-            onClick={handleDraft}
+            onClick={
+              handleDraft
+            }
           >
             {drafting ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -726,27 +1555,74 @@ export function MessageComposer({
             )}
           </GatedButton>
 
+          {/* ==========================================================
+              TEXTAREA
+              ========================================================== */}
+
           <textarea
             ref={textareaRef}
             value={text}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
+            onFocus={() => {
+              const el =
+                textareaRef.current;
+
+              if (!el) {
+                return;
+              }
+
+              requestAnimationFrame(
+                () => {
+                  if (
+                    document.activeElement ===
+                    el
+                  ) {
+                    const length =
+                      el.value.length;
+
+                    try {
+                      el.setSelectionRange(
+                        length,
+                        length
+                      );
+                    } catch {
+                      // Ignora browsers que não suportam seleção.
+                    }
+                  }
+                }
+              );
+            }}
             placeholder={
               readOnly
-                ? t("readOnlyPlaceholder")
+                ? t(
+                    "readOnlyPlaceholder"
+                  )
                 : sessionExpired
-                  ? t("sessionExpiredPlaceholder")
-                  : t("typeMessagePlaceholder")
+                  ? t(
+                      "sessionExpiredPlaceholder"
+                    )
+                  : t(
+                      "typeMessagePlaceholder"
+                    )
             }
-            disabled={sessionExpired || readOnly}
+            disabled={
+              sessionExpired ||
+              readOnly
+            }
             rows={1}
-            // Textarea keeps its own inline title — the GatedButton
-            // wrapping pattern doesn't apply to non-button inputs.
-            // The placeholder text also surfaces the read-only state.
-            title={readOnly ? t("readOnlyTitle") : undefined}
+            title={
+              readOnly
+                ? t(
+                    "readOnlyTitle"
+                  )
+                : undefined
+            }
             className={cn(
               "flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50",
-              (sessionExpired || readOnly) && "cursor-not-allowed opacity-50"
+              (sessionExpired ||
+                readOnly) &&
+                "cursor-not-allowed opacity-50"
             )}
           />
 
@@ -754,8 +1630,14 @@ export function MessageComposer({
             size="sm"
             canAct={!readOnly}
             gateReason="send messages"
-            disabled={!text.trim() || sessionExpired || sending}
-            onClick={handleSend}
+            disabled={
+              !text.trim() ||
+              sessionExpired ||
+              sending
+            }
+            onClick={
+              handleSend
+            }
             className="h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40"
           >
             <Send className="h-4 w-4" />
@@ -763,63 +1645,91 @@ export function MessageComposer({
         </div>
       )}
 
-      {/* Hint sits outside the flex row so its height doesn't push
-          `items-end` buttons below the textarea. Indented to line up
-          under the textarea left edge. */}
       {!draft && !recording && (
         <p className="mt-1 pl-[5.5rem] text-[10px] text-muted-foreground">
           {t("draftHint")}
         </p>
       )}
 
-      {/* Interactive-message builder dialog. */}
-      <Dialog open={interactiveOpen} onOpenChange={setInteractiveOpen}>
+      {/* Interactive-message builder */}
+
+      <Dialog
+        open={interactiveOpen}
+        onOpenChange={
+          setInteractiveOpen
+        }
+      >
         <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>{t("interactiveMessage")}</DialogTitle>
+            <DialogTitle>
+              {t(
+                "interactiveMessage"
+              )}
+            </DialogTitle>
           </DialogHeader>
+
           <div className="max-h-[70vh] overflow-y-auto">
             <InteractiveBuilder
-              value={interactivePayload}
-              onChange={setInteractivePayload}
+              value={
+                interactivePayload
+              }
+              onChange={
+                setInteractivePayload
+              }
             />
           </div>
+
           <DialogFooter>
             <Button
               variant="outline"
-              disabled={savingQuickReply}
-              onClick={saveAsQuickReply}
+              disabled={
+                savingQuickReply
+              }
+              onClick={
+                saveAsQuickReply
+              }
             >
               {savingQuickReply ? (
                 <Loader2 className="mr-1 h-4 w-4 animate-spin" />
               ) : (
                 <Zap className="mr-1 h-4 w-4" />
               )}
-              {t("saveAsQuickReply")}
+
+              {t(
+                "saveAsQuickReply"
+              )}
             </Button>
-            <Button onClick={sendInteractive}>
+
+            <Button
+              onClick={
+                sendInteractive
+              }
+            >
               <Send className="mr-1 h-4 w-4" />
+
               {t("send")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {/* Quick-reply picker. */}
+      {/* Quick-reply picker */}
+
       <QuickReplyPicker
         open={quickReplyOpen}
-        onOpenChange={setQuickReplyOpen}
-        onPick={handlePickQuickReply}
+        onOpenChange={
+          setQuickReplyOpen
+        }
+        onPick={
+          handlePickQuickReply
+        }
       />
     </div>
   );
 }
 
 /**
- * Staged-attachment preview with caption + send/discard. Declared at
- * module scope (not nested in MessageComposer) so React keeps it mounted
- * across the parent's re-renders — a nested component would remount the
- * caption input on every keystroke and drop focus.
+ * Staged-attachment preview with caption + send/discard.
  */
 function MediaDraftPreview({
   draft,
@@ -833,40 +1743,75 @@ function MediaDraftPreview({
   draft: MediaDraft;
   busy: boolean;
   readOnly: boolean;
-  onCaptionChange: (caption: string) => void;
+  onCaptionChange: (
+    caption: string
+  ) => void;
   onDiscard: () => void;
   onSend: () => void;
-  t: ReturnType<typeof useTranslations>;
+  t: ReturnType<
+    typeof useTranslations
+  >;
 }) {
   return (
     <div className="rounded-xl border border-border bg-muted/40 p-3">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          {draft.kind === "image" && (
+          {draft.kind ===
+            "image" && (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={draft.mediaUrl}
-              alt={draft.filename}
+              alt={
+                draft.filename
+              }
               className="max-h-40 rounded-lg object-cover"
             />
           )}
-          {draft.kind === "video" && (
-            <video src={draft.mediaUrl} controls className="max-h-40 rounded-lg" />
+
+          {draft.kind ===
+            "video" && (
+            <video
+              src={
+                draft.mediaUrl
+              }
+              controls
+              className="max-h-40 rounded-lg"
+            />
           )}
-          {draft.kind === "audio" && (
-            <audio src={draft.mediaUrl} controls className="w-full" />
+
+          {draft.kind ===
+            "audio" && (
+            <audio
+              src={
+                draft.mediaUrl
+              }
+              controls
+              className="w-full"
+            />
           )}
-          {draft.kind === "document" && (
+
+          {draft.kind ===
+            "document" && (
             <div className="flex items-center gap-2 text-sm text-foreground">
               <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{draft.filename}</span>
+
+              <span className="truncate">
+                {
+                  draft.filename
+                }
+              </span>
             </div>
           )}
         </div>
+
         <button
           type="button"
-          onClick={onDiscard}
-          aria-label={t("removeAttachment")}
+          onClick={
+            onDiscard
+          }
+          aria-label={t(
+            "removeAttachment"
+          )}
           className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           <X className="h-4 w-4" />
@@ -874,30 +1819,51 @@ function MediaDraftPreview({
       </div>
 
       <div className="mt-2 flex items-end gap-2">
-        {draft.kind !== "audio" && (
+        {draft.kind !==
+          "audio" && (
           <input
-            value={draft.caption}
-            maxLength={MEDIA_CAPTION_MAX}
-            onChange={(e) => onCaptionChange(e.target.value)}
+            value={
+              draft.caption
+            }
+            maxLength={
+              MEDIA_CAPTION_MAX
+            }
+            onChange={(e) =>
+              onCaptionChange(
+                e.target.value
+              )
+            }
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (
+                e.key ===
+                  "Enter" &&
+                !e.shiftKey
+              ) {
                 e.preventDefault();
+
                 onSend();
               }
             }}
-            placeholder={t("addCaption")}
+            placeholder={t(
+              "addCaption"
+            )}
             className="flex-1 rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50"
           />
         )}
+
         <GatedButton
           size="sm"
           canAct={!readOnly}
           gateReason="send messages"
           disabled={busy}
-          onClick={onSend}
+          onClick={
+            onSend
+          }
           className={cn(
             "h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40",
-            draft.kind === "audio" && "ml-auto",
+            draft.kind ===
+              "audio" &&
+              "ml-auto"
           )}
         >
           <Send className="h-4 w-4" />

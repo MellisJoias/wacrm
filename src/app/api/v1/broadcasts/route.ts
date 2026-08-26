@@ -23,51 +23,34 @@ import {
   createBroadcast,
   deliverBroadcast,
   BroadcastError,
+  limitBroadcastPlan,
 } from '@/lib/whatsapp/broadcast-core';
+
+import { supabaseAdmin } from '@/lib/flows/admin-client';
 
 // ============================================================
 // POST /api/v1/broadcasts
 //
-// Esta rota aceita DOIS tipos de autenticação:
+// Cria a campanha e inicia o primeiro delivery pass.
 //
-// 1. WACRM interno:
-//    sessão Supabase do usuário logado.
+// IMPORTANTE:
 //
-// 2. Public API:
-//    Authorization: Bearer wacrm_live_...
+// O navegador recebe 202 imediatamente.
 //
-// O frontend /broadcasts/new NÃO precisa conhecer nenhuma
-// API key.
+// O processamento usa service-role.
 //
-// O envio continua sendo feito pelo broadcast-core.
+// O envio é:
+//   1 destinatário
+//   -> await Meta
+//   -> salva resultado
+//   -> próximo destinatário
 //
-// Fluxo:
-//
-//   WACRM
-//      ↓
-//   sessão Supabase
-//      ↓
-//   createBroadcast()
-//      ↓
-//   broadcasts + broadcast_recipients
-//      ↓
-//   after()
-//      ↓
-//   deliverBroadcast()
-//      ↓
-//   Meta
-//      ↓
-//   messages
-//      ↓
-//   Inbox
-//
+// Quando o lote termina e ainda existem pending,
+// o próprio delivery agenda automaticamente o próximo pass.
 // ============================================================
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
-/**
- * Contexto de autenticação aceito pela rota.
- */
 type BroadcastAuthContext = {
   supabase: Awaited<
     ReturnType<typeof getCurrentAccount>
@@ -80,24 +63,15 @@ type BroadcastAuthContext = {
   authType: 'session' | 'api_key';
 };
 
-/**
- * Resolve a autenticação da requisição.
- *
- * Se existir Authorization: Bearer wacrm_live_...,
- * usa a Public API normalmente.
- *
- * Caso contrário, usa a sessão normal do WACRM.
- *
- * IMPORTANTE:
- * A API key nunca é colocada no frontend.
- */
+// ============================================================
+// Authentication
+// ============================================================
+
 async function resolveBroadcastAuth(
   request: Request,
 ): Promise<BroadcastAuthContext> {
   const authorization =
-    request.headers.get(
-      'authorization',
-    );
+    request.headers.get('authorization');
 
   // ----------------------------------------------------------
   // Public API
@@ -155,6 +129,10 @@ async function resolveBroadcastAuth(
   };
 }
 
+// ============================================================
+// POST
+// ============================================================
+
 export async function POST(
   request: Request,
 ) {
@@ -192,7 +170,7 @@ export async function POST(
     }
 
     // ----------------------------------------------------------
-    // Extract request data
+    // Request data
     // ----------------------------------------------------------
 
     const templateName =
@@ -209,7 +187,7 @@ export async function POST(
         : [];
 
     // ----------------------------------------------------------
-    // Validate recipient structure
+    // Normalize recipients
     // ----------------------------------------------------------
 
     const normalizedRecipients =
@@ -245,18 +223,7 @@ export async function POST(
       );
 
     // ----------------------------------------------------------
-    // Create persistent broadcast plan
-    //
-    // NÃO envia nada para a Meta nesta etapa.
-    //
-    // createBroadcast():
-    //
-    //   broadcasts
-    //   +
-    //   broadcast_recipients
-    //   +
-    //   template_params
-    //
+    // Persist broadcast
     // ----------------------------------------------------------
 
     const plan =
@@ -291,36 +258,77 @@ export async function POST(
       );
 
     // ----------------------------------------------------------
-    // Start asynchronous delivery
+    // IMPORTANTE
+    //
+    // O broadcast pode conter centenas de recipients.
+    //
+    // Não enviamos todos dentro de uma única execução.
+    //
+    // O primeiro pass recebe somente o tamanho definido no
+    // broadcast-core.ts.
     // ----------------------------------------------------------
 
-    after(() =>
-      deliverBroadcast(
-        ctx.supabase,
+    const firstPass =
+      limitBroadcastPlan(
         plan,
-      ).catch(
-        (error) => {
-          console.error(
-            '[POST /api/v1/broadcasts] asynchronous delivery failed:',
-            {
-              broadcastId:
-                plan.broadcastId,
+      );
 
-              accountId:
-                ctx.accountId,
-
-              authType:
-                ctx.authType,
-
-              error,
-            },
-          );
-        },
-      ),
-    );
+    const admin =
+      supabaseAdmin();
 
     // ----------------------------------------------------------
-    // Return immediately
+    // Server-side delivery
+    // ----------------------------------------------------------
+
+    after(async () => {
+      try {
+        console.log(
+          '[POST /api/v1/broadcasts] starting first delivery pass:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            total:
+              plan.planned.length,
+
+            passSize:
+              firstPass.planned.length,
+          },
+        );
+
+        await deliverBroadcast(
+          admin,
+          firstPass,
+        );
+
+        console.log(
+          '[POST /api/v1/broadcasts] first delivery pass finished:',
+          {
+            broadcastId:
+              plan.broadcastId,
+          },
+        );
+      } catch (error) {
+        console.error(
+          '[POST /api/v1/broadcasts] asynchronous delivery failed:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            accountId:
+              ctx.accountId,
+
+            authType:
+              ctx.authType,
+
+            error,
+          },
+        );
+      }
+    });
+
+    // ----------------------------------------------------------
+    // Immediate response
     // ----------------------------------------------------------
 
     return ok(
@@ -374,7 +382,7 @@ export async function POST(
     }
 
     // ----------------------------------------------------------
-    // Session authentication errors
+    // Authentication errors
     // ----------------------------------------------------------
 
     if (
@@ -393,7 +401,7 @@ export async function POST(
     }
 
     // ----------------------------------------------------------
-    // Public API errors / unknown errors
+    // Unknown
     // ----------------------------------------------------------
 
     return toApiErrorResponse(

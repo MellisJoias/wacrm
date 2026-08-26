@@ -1,34 +1,27 @@
 // ============================================================
-// Public-API broadcast core.
+// WhatsApp Broadcast Core
 //
-// Broadcasts are split into two phases:
+// DELIVERY MODEL:
 //
-//   createBroadcast()
-//     - validates the request
-//     - resolves/creates contacts
-//     - deduplicates recipients
-//     - atomically persists the broadcast + recipients
-//     - freezes per-recipient template params
-//     - persists campaign header media URL
-//     - returns a delivery plan
+//   Recipient 1
+//      |
+//      +--> await Meta
+//      |
+//      +--> persist result
+//      |
+//      v
+//   Recipient 2
+//      |
+//      +--> await Meta
+//      |
+//      +--> persist result
+//      |
+//      v
+//   ...
 //
-//   deliverBroadcast()
-//     - sends each recipient through Meta
-//     - retries phone variants when appropriate
-//     - persists the Meta message in the canonical conversation
-//     - stores the WAMID on broadcast_recipients
-//     - stores the rendered template text on broadcast_recipients
-//     - finalizes the broadcast status
+// CONCURRENCY = 1
 //
-// The browser does NOT send WhatsApp messages directly.
-// The route creates the plan and schedules delivery through after().
-//
-// Conversation identity:
-//   account_id + contact_id
-//
-// Every successful Meta send is persisted into the SAME canonical
-// conversation used by normal dashboard/inbound messaging.
-//
+// Nunca existe Promise.all() para recipients.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -52,13 +45,12 @@ import type { MessageTemplate } from '@/types';
 
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
 
-import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation';
 import { createAdminClient } from '@/lib/supabase/admin';
 
-/**
- * Thrown by createBroadcast on a caller-visible failure.
- * The API route maps this into the public API error envelope.
- */
+// ============================================================
+// Errors
+// ============================================================
+
 export class BroadcastError extends Error {
   readonly code: string;
   readonly status: number;
@@ -75,23 +67,15 @@ export class BroadcastError extends Error {
   }
 }
 
-/**
- * Recipient received by the public broadcast API.
- *
- * `to` is the destination phone.
- *
- * `params` contains the positional body variables:
- *
- *   {{1}}, {{2}}, {{3}}, ...
- */
+// ============================================================
+// Types
+// ============================================================
+
 export interface BroadcastRecipientInput {
   to: string;
   params?: string[];
 }
 
-/**
- * Parameters required to create a broadcast.
- */
 export interface CreateBroadcastParams {
   name?: string | null;
 
@@ -101,29 +85,16 @@ export interface CreateBroadcastParams {
 
   recipients: BroadcastRecipientInput[];
 
-  /**
-   * Optional campaign-level media URL used by image/video/document
-   * template headers.
-   *
-   * This is persisted on broadcasts.header_media_url so delivery
-   * and resume can reconstruct the exact campaign later.
-   */
   headerMediaUrl?: string | null;
 }
 
-interface PlannedRecipient {
+export interface PlannedRecipient {
   recipientRowId: string;
   contactId: string;
   phone: string;
   params: string[];
 }
 
-/**
- * Everything required by deliverBroadcast().
- *
- * The plan is intentionally self-contained because delivery happens
- * asynchronously in after().
- */
 export interface BroadcastPlan {
   broadcastId: string;
 
@@ -141,37 +112,45 @@ export interface BroadcastPlan {
 
   templateRow: MessageTemplate | null;
 
-  /**
-   * Campaign-level header media URL.
-   *
-   * Used for image/video/document template headers.
-   *
-   * Optional for backwards compatibility with existing callers/tests
-   * that construct BroadcastPlan objects manually.
-   */
   headerMediaUrl?: string | null;
 
   planned: PlannedRecipient[];
 
-  /**
-   * Phones rejected before recipient rows were created.
-   *
-   * These are invalid E.164 numbers.
-   */
   rejected: number;
 }
 
-const MAX_RECIPIENTS = 1000;
+// ============================================================
+// Limits
+// ============================================================
+
+export const MAX_RECIPIENTS =
+  1000;
 
 /**
- * Validate and persist a broadcast.
+ * Quantos recipients uma execução da Vercel processa.
  *
- * IMPORTANT:
- * Nothing is sent to Meta in this phase.
+ * IMPORTANTE:
  *
- * The function only prepares the delivery plan and atomically persists
- * the campaign and recipient rows.
+ * Isto NÃO significa concorrência 50.
+ *
+ * Continua:
+ *
+ *   1 -> await
+ *   2 -> await
+ *   3 -> await
+ *   ...
+ *
+ * até 50.
+ *
+ * Depois um novo pass é criado automaticamente.
  */
+export const DELIVERY_BATCH_SIZE =
+  50;
+
+// ============================================================
+// Create broadcast
+// ============================================================
+
 export async function createBroadcast(
   db: SupabaseClient,
   accountId: string,
@@ -185,9 +164,9 @@ export async function createBroadcast(
     headerMediaUrl,
   } = params;
 
-  // ------------------------------------------------------------
-  // Basic validation
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Validation
+  // ----------------------------------------------------------
 
   if (!templateName) {
     throw new BroadcastError(
@@ -208,7 +187,10 @@ export async function createBroadcast(
     );
   }
 
-  if (recipients.length > MAX_RECIPIENTS) {
+  if (
+    recipients.length >
+    MAX_RECIPIENTS
+  ) {
     throw new BroadcastError(
       'bad_request',
       `A broadcast is capped at ${MAX_RECIPIENTS} recipients per request; split larger sends`,
@@ -216,9 +198,9 @@ export async function createBroadcast(
     );
   }
 
-  // ------------------------------------------------------------
-  // WhatsApp configuration
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // WhatsApp config
+  // ----------------------------------------------------------
 
   const {
     data: config,
@@ -226,10 +208,16 @@ export async function createBroadcast(
   } = await db
     .from('whatsapp_config')
     .select('*')
-    .eq('account_id', accountId)
+    .eq(
+      'account_id',
+      accountId,
+    )
     .single();
 
-  if (configError || !config) {
+  if (
+    configError ||
+    !config
+  ) {
     throw new BroadcastError(
       'whatsapp_not_configured',
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
@@ -237,13 +225,14 @@ export async function createBroadcast(
     );
   }
 
-  const accessToken = decrypt(
-    config.access_token,
-  );
+  const accessToken =
+    decrypt(
+      config.access_token,
+    );
 
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
   // Template
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
 
   const resolvedTemplate =
     await resolveTemplateRow(
@@ -253,7 +242,9 @@ export async function createBroadcast(
       params.templateLanguage,
     );
 
-  if (resolvedTemplate.malformed) {
+  if (
+    resolvedTemplate.malformed
+  ) {
     throw new BroadcastError(
       'template_malformed',
       'Template row is malformed locally — run "Sync from Meta" in Settings to repair it before broadcasting.',
@@ -264,9 +255,9 @@ export async function createBroadcast(
   const templateRow =
     resolvedTemplate.row;
 
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
   // Header media
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
 
   const normalizedHeaderMediaUrl =
     typeof headerMediaUrl === 'string'
@@ -278,9 +269,9 @@ export async function createBroadcast(
     templateRow?.header_media_url ||
     null;
 
-  // ------------------------------------------------------------
-  // Contact resolution
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Resolve contacts
+  // ----------------------------------------------------------
 
   const resolved: {
     contactId: string;
@@ -290,15 +281,22 @@ export async function createBroadcast(
 
   let rejected = 0;
 
-  for (const recipient of recipients) {
+  for (
+    const recipient of recipients
+  ) {
     const sanitized =
       sanitizePhoneForMeta(
-        typeof recipient.to === 'string'
+        typeof recipient.to ===
+          'string'
           ? recipient.to
           : '',
       );
 
-    if (!isValidE164(sanitized)) {
+    if (
+      !isValidE164(
+        sanitized,
+      )
+    ) {
       rejected++;
       continue;
     }
@@ -309,36 +307,45 @@ export async function createBroadcast(
         accountId,
         auditUserId,
         {
-          phone: sanitized,
+          phone:
+            sanitized,
         },
       );
 
     resolved.push({
-      contactId: id,
-      phone: sanitized,
-      params: Array.isArray(
-        recipient.params,
-      )
-        ? recipient.params.filter(
-            (
-              value,
-            ): value is string =>
-              typeof value === 'string',
-          )
-        : [],
+      contactId:
+        id,
+
+      phone:
+        sanitized,
+
+      params:
+        Array.isArray(
+          recipient.params,
+        )
+          ? recipient.params.filter(
+              (
+                value,
+              ): value is string =>
+                typeof value ===
+                'string',
+            )
+          : [],
     });
   }
 
-  // ------------------------------------------------------------
-  // Contact deduplication
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Deduplicate contacts
+  // ----------------------------------------------------------
 
   const seenContact =
     new Set<string>();
 
   const deduped =
     resolved.filter(
-      (recipient) => {
+      (
+        recipient,
+      ) => {
         if (
           seenContact.has(
             recipient.contactId,
@@ -355,7 +362,9 @@ export async function createBroadcast(
       },
     );
 
-  if (deduped.length === 0) {
+  if (
+    deduped.length === 0
+  ) {
     throw new BroadcastError(
       'bad_request',
       'No recipients had a valid E.164 phone number',
@@ -363,53 +372,59 @@ export async function createBroadcast(
     );
   }
 
-  // ------------------------------------------------------------
-  // Atomic broadcast persistence
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Atomic persistence
+  // ----------------------------------------------------------
 
-  const adminDb = createAdminClient();
+  const adminDb =
+    createAdminClient();
 
   const {
     data: createdRows,
     error: createErr,
-  } = await adminDb.rpc(
-    'create_broadcast_with_recipients',
-    {
-      p_account_id:
-        accountId,
+  } =
+    await adminDb.rpc(
+      'create_broadcast_with_recipients',
+      {
+        p_account_id:
+          accountId,
 
-      p_user_id:
-        auditUserId,
+        p_user_id:
+          auditUserId,
 
-      p_name:
-        name ||
-        `API broadcast (${templateName})`,
+        p_name:
+          name ||
+          `API broadcast (${templateName})`,
 
-      p_template_name:
-        templateName,
+        p_template_name:
+          templateName,
 
-      p_template_language:
-        resolvedTemplate.language,
+        p_template_language:
+          resolvedTemplate.language,
 
-      p_total_recipients:
-        deduped.length,
+        p_total_recipients:
+          deduped.length,
 
-      p_contact_ids:
-        deduped.map(
-          (recipient) =>
-            recipient.contactId,
-        ),
+        p_contact_ids:
+          deduped.map(
+            (
+              recipient,
+            ) =>
+              recipient.contactId,
+          ),
 
-      p_template_params:
-        deduped.map(
-          (recipient) =>
-            recipient.params,
-        ),
+        p_template_params:
+          deduped.map(
+            (
+              recipient,
+            ) =>
+              recipient.params,
+          ),
 
-      p_header_media_url:
-        effectiveHeaderMediaUrl,
-    },
-  );
+        p_header_media_url:
+          effectiveHeaderMediaUrl,
+      },
+    );
 
   if (
     createErr ||
@@ -432,14 +447,16 @@ export async function createBroadcast(
     createdRows[0]
       .broadcast_id as string;
 
-  // ------------------------------------------------------------
-  // Map inserted rows back to resolved recipients
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------
+  // Map recipients
+  // ----------------------------------------------------------
 
   const byContact =
     new Map(
       deduped.map(
-        (recipient) => [
+        (
+          recipient,
+        ) => [
           recipient.contactId,
           recipient,
         ],
@@ -448,16 +465,20 @@ export async function createBroadcast(
 
   const planned: PlannedRecipient[] =
     createdRows.map(
-      (row: {
-        recipient_id: string;
-        contact_id: string;
-      }) => {
+      (
+        row: {
+          recipient_id: string;
+          contact_id: string;
+        },
+      ) => {
         const recipient =
           byContact.get(
             row.contact_id,
           );
 
-        if (!recipient) {
+        if (
+          !recipient
+        ) {
           throw new BroadcastError(
             'internal',
             'Broadcast recipient could not be mapped to its contact',
@@ -509,20 +530,38 @@ export async function createBroadcast(
   };
 }
 
-/**
- * Resolve the local template used to reconstruct the message text.
- *
- * The send has already been accepted by Meta when this function is
- * called. Therefore this function is strictly for local persistence.
- */
+// ============================================================
+// Limit current delivery plan
+// ============================================================
+
+export function limitBroadcastPlan(
+  plan: BroadcastPlan,
+): BroadcastPlan {
+  return {
+    ...plan,
+
+    planned:
+      plan.planned.slice(
+        0,
+        DELIVERY_BATCH_SIZE,
+      ),
+  };
+}
+
+// ============================================================
+// Resolve template for persistence
+// ============================================================
+
 async function resolveBroadcastTemplateForPersistence(
   db: SupabaseClient,
   plan: BroadcastPlan,
 ): Promise<MessageTemplate | null> {
   if (
     plan.templateRow &&
-    typeof plan.templateRow.body_text === 'string' &&
-    plan.templateRow.body_text.length > 0
+    typeof plan.templateRow.body_text ===
+      'string' &&
+    plan.templateRow.body_text.length >
+      0
   ) {
     return plan.templateRow;
   }
@@ -539,8 +578,10 @@ async function resolveBroadcastTemplateForPersistence(
     if (
       !resolved.malformed &&
       resolved.row &&
-      typeof resolved.row.body_text === 'string' &&
-      resolved.row.body_text.length > 0
+      typeof resolved.row.body_text ===
+        'string' &&
+      resolved.row.body_text.length >
+        0
     ) {
       return resolved.row;
     }
@@ -551,33 +592,34 @@ async function resolveBroadcastTemplateForPersistence(
     );
   }
 
-  /**
-   * Last fallback: find any local translation containing body_text.
-   */
   try {
     const {
       data,
       error,
     } = await db
-      .from('message_templates')
+      .from(
+        'message_templates',
+      )
       .select('*')
-      .eq('account_id', plan.accountId)
-      .eq('name', plan.templateName)
-      .not('body_text', 'is', null)
+      .eq(
+        'account_id',
+        plan.accountId,
+      )
+      .eq(
+        'name',
+        plan.templateName,
+      )
+      .not(
+        'body_text',
+        'is',
+        null,
+      )
       .limit(20);
 
     if (error) {
       console.error(
         '[broadcast-core] fallback template lookup failed:',
-        {
-          accountId:
-            plan.accountId,
-
-          templateName:
-            plan.templateName,
-
-          error,
-        },
+        error,
       );
 
       return null;
@@ -585,10 +627,14 @@ async function resolveBroadcastTemplateForPersistence(
 
     const rows =
       Array.isArray(data)
-        ? (data as MessageTemplate[])
+        ? (
+            data as MessageTemplate[]
+          )
         : [];
 
-    if (rows.length === 0) {
+    if (
+      rows.length === 0
+    ) {
       return null;
     }
 
@@ -598,9 +644,13 @@ async function resolveBroadcastTemplateForPersistence(
     if (wanted) {
       const exact =
         rows.find(
-          (row) =>
-            typeof row.language === 'string' &&
-            row.language.toLowerCase() === wanted &&
+          (
+            row,
+          ) =>
+            typeof row.language ===
+              'string' &&
+            row.language.toLowerCase() ===
+              wanted &&
             !!row.body_text,
         );
 
@@ -609,15 +659,23 @@ async function resolveBroadcastTemplateForPersistence(
       }
 
       const wantedBase =
-        wanted.split(/[_-]/)[0];
+        wanted.split(
+          /[_-]/,
+        )[0];
 
       const sameBase =
         rows.find(
-          (row) =>
-            typeof row.language === 'string' &&
+          (
+            row,
+          ) =>
+            typeof row.language ===
+              'string' &&
             row.language
               .toLowerCase()
-              .split(/[_-]/)[0] === wantedBase &&
+              .split(
+                /[_-]/,
+              )[0] ===
+              wantedBase &&
             !!row.body_text,
         );
 
@@ -628,7 +686,10 @@ async function resolveBroadcastTemplateForPersistence(
 
     return (
       rows.find(
-        (row) => !!row.body_text,
+        (
+          row,
+        ) =>
+          !!row.body_text,
       ) ?? null
     );
   } catch (error) {
@@ -641,38 +702,166 @@ async function resolveBroadcastTemplateForPersistence(
   }
 }
 
-/**
- * Persist a successful broadcast send into the canonical conversation.
- *
- * This is the critical Inbox persistence path.
- *
- * One successful Meta send must result in:
- *
- *   broadcast_recipients.message_text
- *   messages.content_text
- *   conversations.last_message_text
- *
- * using the SAME conversation_id.
- */
+// ============================================================
+// Resolve canonical conversation
+// ============================================================
+
+async function resolveCanonicalConversation(
+  db: SupabaseClient,
+  plan: BroadcastPlan,
+  recipient: PlannedRecipient,
+): Promise<{
+  conversationId: string;
+}> {
+  const {
+    data: existing,
+    error: lookupError,
+  } = await db
+    .from(
+      'conversations',
+    )
+    .select('id')
+    .eq(
+      'account_id',
+      plan.accountId,
+    )
+    .eq(
+      'contact_id',
+      recipient.contactId,
+    )
+    .order(
+      'created_at',
+      {
+        ascending:
+          true,
+      },
+    )
+    .limit(1);
+
+  if (lookupError) {
+    console.error(
+      '[broadcast-core] canonical conversation lookup failed:',
+      lookupError,
+    );
+
+    throw new Error(
+      'Failed to resolve canonical conversation',
+    );
+  }
+
+  if (
+    existing &&
+    existing.length > 0
+  ) {
+    return {
+      conversationId:
+        existing[0].id,
+    };
+  }
+
+  const {
+    data: created,
+    error: createError,
+  } = await db
+    .from(
+      'conversations',
+    )
+    .insert({
+      account_id:
+        plan.accountId,
+
+      user_id:
+        plan.auditUserId,
+
+      contact_id:
+        recipient.contactId,
+    })
+    .select('id')
+    .single();
+
+  if (
+    !createError &&
+    created
+  ) {
+    return {
+      conversationId:
+        created.id,
+    };
+  }
+
+  if (
+    createError &&
+    (
+      createError.code ===
+        '23505' ||
+      /duplicate|unique/i.test(
+        createError.message ??
+          '',
+      )
+    )
+  ) {
+    const {
+      data: raced,
+      error: racedError,
+    } = await db
+      .from(
+        'conversations',
+      )
+      .select('id')
+      .eq(
+        'account_id',
+        plan.accountId,
+      )
+      .eq(
+        'contact_id',
+        recipient.contactId,
+      )
+      .order(
+        'created_at',
+        {
+          ascending:
+            true,
+        },
+      )
+      .limit(1);
+
+    if (
+      !racedError &&
+      raced &&
+      raced.length > 0
+    ) {
+      return {
+        conversationId:
+          raced[0].id,
+      };
+    }
+  }
+
+  console.error(
+    '[broadcast-core] canonical conversation creation failed:',
+    createError,
+  );
+
+  throw new Error(
+    'Failed to create canonical conversation',
+  );
+}
+
+// ============================================================
+// Persist successful message
+// ============================================================
+
 async function persistBroadcastMessage(
   db: SupabaseClient,
   plan: BroadcastPlan,
   recipient: PlannedRecipient,
   whatsappMessageId: string,
 ): Promise<void> {
-  // ------------------------------------------------------------
-  // Resolve template
-  // ------------------------------------------------------------
-
   const templateRow =
     await resolveBroadcastTemplateForPersistence(
       db,
       plan,
     );
-
-  // ------------------------------------------------------------
-  // Render exact body
-  // ------------------------------------------------------------
 
   const renderedText =
     templateContentText(
@@ -681,59 +870,21 @@ async function persistBroadcastMessage(
     );
 
   const finalText =
-    typeof renderedText === 'string'
+    typeof renderedText ===
+      'string'
       ? renderedText.trim()
       : '';
 
-  console.log(
-    '[broadcast-core] persistence payload:',
-    {
-      broadcastId:
-        plan.broadcastId,
-
-      recipientRowId:
-        recipient.recipientRowId,
-
-      contactId:
-        recipient.contactId,
-
-      phone:
-        recipient.phone,
-
-      templateName:
-        plan.templateName,
-
-      templateLanguage:
-        plan.templateLanguage,
-
-      templateFound:
-        !!templateRow,
-
-      templateBody:
-        templateRow?.body_text ?? null,
-
-      templateParams:
-        recipient.params,
-
-      renderedText:
-        finalText,
-
-      whatsappMessageId,
-    },
-  );
-
-  // ------------------------------------------------------------
-  // Resolve canonical conversation
-  // ------------------------------------------------------------
-
-  let resolved;
+  let resolved: {
+    conversationId: string;
+  };
 
   try {
     resolved =
-      await resolveConversationByPhone(
+      await resolveCanonicalConversation(
         db,
-        plan.accountId,
-        recipient.phone,
+        plan,
+        recipient,
       );
   } catch (error) {
     console.error(
@@ -751,6 +902,8 @@ async function persistBroadcastMessage(
         phone:
           recipient.phone,
 
+        whatsappMessageId,
+
         error,
       },
     );
@@ -758,105 +911,96 @@ async function persistBroadcastMessage(
     return;
   }
 
-  if (!resolved?.conversationId) {
-    console.error(
-      '[broadcast-core] canonical conversation was not resolved:',
-      {
-        broadcastId:
-          plan.broadcastId,
-
-        recipientRowId:
-          recipient.recipientRowId,
-
-        contactId:
-          recipient.contactId,
-
-        phone:
-          recipient.phone,
-
-        whatsappMessageId,
-      },
-    );
-
+  if (
+    !resolved?.conversationId
+  ) {
     return;
   }
 
-  console.log(
-    '[broadcast-core] canonical conversation resolved:',
-    {
-      conversationId:
-        resolved.conversationId,
-
-      contactId:
-        resolved.contactId,
-
-      broadcastId:
-        plan.broadcastId,
-
-      recipientRowId:
-        recipient.recipientRowId,
-    },
-  );
-
-  // ------------------------------------------------------------
-  // Persist rendered text on broadcast_recipients
-  // ------------------------------------------------------------
-
   const {
-    error: recipientTextError,
+    error:
+      recipientTextError,
   } = await db
-    .from('broadcast_recipients')
+    .from(
+      'broadcast_recipients',
+    )
     .update({
       message_text:
-        finalText || null,
+        finalText ||
+        null,
     })
     .eq(
       'id',
       recipient.recipientRowId,
     );
 
-  if (recipientTextError) {
+  if (
+    recipientTextError
+  ) {
     console.error(
       '[broadcast-core] FAILED broadcast_recipients.message_text update:',
-      {
-        broadcastId:
-          plan.broadcastId,
-
-        recipientRowId:
-          recipient.recipientRowId,
-
-        renderedText:
-          finalText,
-
-        error:
-          recipientTextError,
-      },
-    );
-  } else {
-    console.log(
-      '[broadcast-core] broadcast_recipients.message_text saved:',
-      {
-        recipientRowId:
-          recipient.recipientRowId,
-
-        messageText:
-          finalText,
-      },
+      recipientTextError,
     );
   }
 
-  // ------------------------------------------------------------
-  // Insert canonical messages row
-  // ------------------------------------------------------------
+  const {
+    data: existingMessage,
+    error:
+      existingMessageError,
+  } = await db
+    .from('messages')
+    .select(
+      'id, conversation_id, content_text, created_at',
+    )
+    .eq(
+      'message_id',
+      whatsappMessageId,
+    )
+    .maybeSingle();
 
-  /**
-   * Do NOT skip the insert when the local template body is missing.
-   *
-   * The Meta message already exists.
-   *
-   * Persisting the canonical row is more important than silently
-   * dropping the message from the Inbox.
-   */
+  if (
+    existingMessageError
+  ) {
+    console.error(
+      '[broadcast-core] existing message lookup failed:',
+      existingMessageError,
+    );
+  }
+
+  const now =
+    new Date().toISOString();
+
+  if (
+    existingMessage &&
+    existingMessage.id
+  ) {
+    await db
+      .from(
+        'conversations',
+      )
+      .update({
+        last_message_text:
+          finalText ||
+          '[template]',
+
+        last_message_at:
+          now,
+
+        updated_at:
+          now,
+      })
+      .eq(
+        'id',
+        resolved.conversationId,
+      )
+      .eq(
+        'account_id',
+        plan.accountId,
+      );
+
+    return;
+  }
+
   const messagePayload = {
     conversation_id:
       resolved.conversationId,
@@ -871,7 +1015,8 @@ async function persistBroadcastMessage(
       'template',
 
     content_text:
-      finalText || null,
+      finalText ||
+      null,
 
     template_name:
       plan.templateName,
@@ -883,71 +1028,44 @@ async function persistBroadcastMessage(
       'sent',
   };
 
-  console.log(
-    '[broadcast-core] inserting messages row:',
-    messagePayload,
-  );
-
   const {
-    data: insertedMessage,
-    error: messageError,
+    error:
+      messageError,
   } = await db
     .from('messages')
-    .insert(messagePayload)
-    .select('id, conversation_id, content_type, content_text, template_name, message_id, status, created_at')
+    .insert(
+      messagePayload,
+    )
+    .select(
+      'id',
+    )
     .single();
 
-  if (messageError) {
+  if (
+    messageError &&
+    messageError.code !==
+      '23505' &&
+    !/duplicate|unique/i.test(
+      messageError.message ??
+        '',
+    )
+  ) {
     console.error(
       '[broadcast-core] FAILED messages INSERT:',
-      {
-        broadcastId:
-          plan.broadcastId,
-
-        recipientRowId:
-          recipient.recipientRowId,
-
-        conversationId:
-          resolved.conversationId,
-
-        contactId:
-          resolved.contactId,
-
-        whatsappMessageId,
-
-        renderedText:
-          finalText,
-
-        payload:
-          messagePayload,
-
-        error:
-          messageError,
-      },
+      messageError,
     );
 
     return;
   }
 
-  console.log(
-    '[broadcast-core] messages row inserted successfully:',
-    insertedMessage,
-  );
-
-  // ------------------------------------------------------------
-  // Update Inbox conversation preview
-  // ------------------------------------------------------------
-
-  const now =
-    new Date().toISOString();
-
-  const {
-    error: conversationError,
-  } = await db
-    .from('conversations')
+  await db
+    .from(
+      'conversations',
+    )
     .update({
       last_message_text:
-        finalText || '[template]',
+        finalText ||
+        '[template]',
 
       last_message_at:
         now,
@@ -963,60 +1081,108 @@ async function persistBroadcastMessage(
       'account_id',
       plan.accountId,
     );
+}
 
-  if (conversationError) {
-    console.error(
-      '[broadcast-core] FAILED conversations preview update:',
-      {
-        broadcastId:
-          plan.broadcastId,
+// ============================================================
+// Number without WhatsApp
+// ============================================================
 
-        recipientRowId:
-          recipient.recipientRowId,
+function isNumberWithoutWhatsAppError(
+  errorMessage: string,
+): boolean {
+  const normalized =
+    errorMessage
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(
+        /[\u0300-\u036f]/g,
+        '',
+      );
 
-        conversationId:
-          resolved.conversationId,
-
-        renderedText:
-          finalText,
-
-        error:
-          conversationError,
-      },
-    );
-
-    return;
-  }
-
-  console.log(
-    '[broadcast-core] Inbox conversation preview updated:',
-    {
-      conversationId:
-        resolved.conversationId,
-
-      lastMessageText:
-        finalText || '[template]',
-
-      lastMessageAt:
-        now,
-    },
+  return (
+    normalized.includes(
+      'not a whatsapp user',
+    ) ||
+    normalized.includes(
+      'not registered',
+    ) ||
+    normalized.includes(
+      'not on whatsapp',
+    ) ||
+    normalized.includes(
+      'does not have a whatsapp',
+    ) ||
+    normalized.includes(
+      'not a valid whatsapp',
+    ) ||
+    normalized.includes(
+      'recipient is not a whatsapp user',
+    ) ||
+    normalized.includes(
+      'phone number is not registered',
+    ) ||
+    normalized.includes(
+      'recipient phone number is not registered',
+    ) ||
+    normalized.includes(
+      'number is not registered',
+    )
   );
 }
 
-/**
- * Fan out a BroadcastPlan.
- *
- * Each recipient is sent independently.
- *
- * A failure for one recipient never aborts the remaining recipients.
- *
- * This function is designed to run inside Next.js after().
- */
+// ============================================================
+// DELIVERY
+// ============================================================
+//
+// ESTE É O PONTO CENTRAL.
+//
+// Não existe Promise.all().
+//
+// Cada recipient termina completamente antes do próximo.
+//
+// ============================================================
+
 export async function deliverBroadcast(
   db: SupabaseClient,
   plan: BroadcastPlan,
 ): Promise<void> {
-  for (const recipient of plan.planned) {
+  let processed = 0;
+
+  let sent = 0;
+
+  let failed = 0;
+
+  const total =
+    plan.planned.length;
+
+  console.log(
+    '[broadcast-core] STARTING SEQUENTIAL DELIVERY',
+    {
+      broadcastId:
+        plan.broadcastId,
+
+      total,
+
+      concurrency:
+        1,
+    },
+  );
+
+  // ----------------------------------------------------------
+  // SEQUENTIAL LOOP
+  // ----------------------------------------------------------
+
+  for (
+    const recipient of plan.planned
+  ) {
+    processed++;
+
+    const position =
+      processed;
+
+    const startedAt =
+      Date.now();
+
     const variants =
       phoneVariants(
         recipient.phone,
@@ -1030,6 +1196,9 @@ export async function deliverBroadcast(
       | string
       | null = null;
 
+    let numberWithoutWhatsApp =
+      false;
+
     const messageParams =
       plan.headerMediaUrl
         ? {
@@ -1038,12 +1207,52 @@ export async function deliverBroadcast(
           }
         : undefined;
 
-    // ----------------------------------------------------------
-    // Send through Meta
-    // ----------------------------------------------------------
+    console.log(
+      '[broadcast-core] START RECIPIENT',
+      {
+        broadcastId:
+          plan.broadcastId,
 
-    for (const variant of variants) {
+        position:
+          `${position}/${total}`,
+
+        recipientRowId:
+          recipient.recipientRowId,
+
+        phone:
+          recipient.phone,
+      },
+    );
+
+    // --------------------------------------------------------
+    // Phone variants também são sequenciais.
+    // --------------------------------------------------------
+
+    for (
+      const variant of variants
+    ) {
       try {
+        console.log(
+          '[broadcast-core] WAITING FOR META',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            position:
+              `${position}/${total}`,
+
+            phone:
+              variant,
+          },
+        );
+
+        // ======================================================
+        // CRÍTICO:
+        //
+        // O próximo recipient NÃO começa antes deste await
+        // terminar.
+        // ======================================================
+
         const result =
           await sendTemplateMessage({
             phoneNumberId:
@@ -1074,7 +1283,29 @@ export async function deliverBroadcast(
         sentMessageId =
           result.messageId;
 
-        lastError = null;
+        lastError =
+          null;
+
+        console.log(
+          '[broadcast-core] META ACCEPTED',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            position:
+              `${position}/${total}`,
+
+            phone:
+              variant,
+
+            whatsappMessageId:
+              sentMessageId,
+
+            elapsedMs:
+              Date.now() -
+              startedAt,
+          },
+        );
 
         break;
       } catch (error) {
@@ -1087,24 +1318,32 @@ export async function deliverBroadcast(
           message;
 
         console.error(
-          '[broadcast-core] Meta template send failed:',
+          '[broadcast-core] META SEND FAILED',
           {
             broadcastId:
               plan.broadcastId,
 
-            recipientRowId:
-              recipient.recipientRowId,
+            position:
+              `${position}/${total}`,
 
             phone:
               variant,
-
-            templateName:
-              plan.templateName,
 
             error:
               message,
           },
         );
+
+        if (
+          isNumberWithoutWhatsAppError(
+            message,
+          )
+        ) {
+          numberWithoutWhatsApp =
+            true;
+
+          break;
+        }
 
         if (
           !isRecipientNotAllowedError(
@@ -1113,14 +1352,30 @@ export async function deliverBroadcast(
         ) {
           break;
         }
+
+        console.log(
+          '[broadcast-core] trying next phone variant',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            recipientRowId:
+              recipient.recipientRowId,
+          },
+        );
       }
     }
 
-    // ------------------------------------------------------------
-    // Successful send
-    // ------------------------------------------------------------
+    // ----------------------------------------------------------
+    // SUCCESS
+    // ----------------------------------------------------------
 
-    if (sentMessageId) {
+    if (
+      sentMessageId
+    ) {
+      const sentAt =
+        new Date().toISOString();
+
       const {
         error:
           recipientUpdateError,
@@ -1133,7 +1388,7 @@ export async function deliverBroadcast(
             'sent',
 
           sent_at:
-            new Date().toISOString(),
+            sentAt,
 
           whatsapp_message_id:
             sentMessageId,
@@ -1150,76 +1405,156 @@ export async function deliverBroadcast(
         recipientUpdateError
       ) {
         console.error(
-          '[broadcast-core] failed to update broadcast recipient:',
-          {
-            broadcastId:
-              plan.broadcastId,
-
-            recipientRowId:
-              recipient.recipientRowId,
-
-            whatsappMessageId:
-              sentMessageId,
-
-            error:
-              recipientUpdateError,
-          },
+          '[broadcast-core] failed updating broadcast recipient:',
+          recipientUpdateError,
         );
       }
 
-      /**
-       * Critical canonical persistence.
-       */
+      sent++;
+
+      // --------------------------------------------------------
+      // Meta já aceitou.
+      //
+      // Persistência é aguardada antes do próximo recipient.
+      // --------------------------------------------------------
+
       await persistBroadcastMessage(
         db,
         plan,
         recipient,
         sentMessageId,
       );
-    } else {
-      // --------------------------------------------------------
-      // Failed send
-      // --------------------------------------------------------
 
-      const {
-        error:
-          recipientUpdateError,
-      } = await db
-        .from(
-          'broadcast_recipients',
-        )
-        .update({
+      console.log(
+        '[broadcast-core] RECIPIENT COMPLETE',
+        {
+          broadcastId:
+            plan.broadcastId,
+
+          position:
+            `${position}/${total}`,
+
+          phone:
+            recipient.phone,
+
           status:
-            'failed',
+            'sent',
 
-          error_message:
-            lastError ||
-            'Unknown error',
-        })
-        .eq(
-          'id',
-          recipient.recipientRowId,
-        );
+          sent,
 
-      if (
-        recipientUpdateError
-      ) {
-        console.error(
-          '[broadcast-core] failed to mark broadcast recipient failed:',
-          {
-            broadcastId:
-              plan.broadcastId,
+          failed,
 
-            recipientRowId:
-              recipient.recipientRowId,
+          remaining:
+            total -
+            processed,
 
-            error:
-              recipientUpdateError,
-          },
-        );
-      }
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        },
+      );
+
+      continue;
     }
+
+    // ----------------------------------------------------------
+    // FAILURE
+    // ----------------------------------------------------------
+
+    failed++;
+
+    const failureMessage =
+      numberWithoutWhatsApp
+        ? 'Número não possui WhatsApp'
+        : (
+            lastError ||
+            'Unknown error'
+          );
+
+    const {
+      error:
+        recipientUpdateError,
+    } = await db
+      .from(
+        'broadcast_recipients',
+      )
+      .update({
+        status:
+          'failed',
+
+        error_message:
+          failureMessage,
+      })
+      .eq(
+        'id',
+        recipient.recipientRowId,
+      );
+
+    if (
+      recipientUpdateError
+    ) {
+      console.error(
+        '[broadcast-core] failed marking recipient failed:',
+        recipientUpdateError,
+      );
+    }
+
+    console.warn(
+      '[broadcast-core] RECIPIENT FAILED',
+      {
+        broadcastId:
+          plan.broadcastId,
+
+        position:
+          `${position}/${total}`,
+
+        phone:
+          recipient.phone,
+
+        reason:
+          failureMessage,
+
+        sent,
+
+        failed,
+
+        remaining:
+          total -
+          processed,
+
+        elapsedMs:
+          Date.now() -
+          startedAt,
+      },
+    );
+
+    // Não lança erro.
+    //
+    // O próximo recipient continua.
   }
+
+  // ----------------------------------------------------------
+  // Pass finished
+  // ----------------------------------------------------------
+
+  console.log(
+    '[broadcast-core] DELIVERY PASS FINISHED',
+    {
+      broadcastId:
+        plan.broadcastId,
+
+      total,
+
+      processed,
+
+      sent,
+
+      failed,
+
+      concurrency:
+        1,
+    },
+  );
 
   await finalizeBroadcastStatus(
     db,
@@ -1227,11 +1562,10 @@ export async function deliverBroadcast(
   );
 }
 
-/**
- * Finalize a broadcast once no recipient remains pending.
- *
- * If pending rows still exist, the campaign remains "sending".
- */
+// ============================================================
+// Finalize
+// ============================================================
+
 export async function finalizeBroadcastStatus(
   db: SupabaseClient,
   broadcastId: string,
@@ -1240,34 +1574,72 @@ export async function finalizeBroadcastStatus(
     async (
       status: string,
     ): Promise<number> => {
-      const { count } =
-        await db
-          .from(
-            'broadcast_recipients',
-          )
-          .select('id', {
-            count: 'exact',
-            head: true,
-          })
-          .eq(
-            'broadcast_id',
+      const {
+        count,
+        error,
+      } = await db
+        .from(
+          'broadcast_recipients',
+        )
+        .select(
+          'id',
+          {
+            count:
+              'exact',
+
+            head:
+              true,
+          },
+        )
+        .eq(
+          'broadcast_id',
+          broadcastId,
+        )
+        .eq(
+          'status',
+          status,
+        );
+
+      if (error) {
+        console.error(
+          '[broadcast-core] failed counting recipient status:',
+          {
             broadcastId,
-          )
-          .eq(
-            'status',
             status,
-          );
+            error,
+          },
+        );
+      }
 
       return count ?? 0;
     };
 
-  if (
-    (await countWhere(
+  const pending =
+    await countWhere(
       'pending',
-    )) > 0
+    );
+
+  // ----------------------------------------------------------
+  // Ainda há recipients.
+  // ----------------------------------------------------------
+
+  if (
+    pending > 0
   ) {
+    console.log(
+      '[broadcast-core] broadcast remains sending',
+      {
+        broadcastId,
+        pending,
+      },
+    );
+
     return;
   }
+
+  // ----------------------------------------------------------
+  // Nenhum pending.
+  // ----------------------------------------------------------
 
   const failed =
     await countWhere(
@@ -1276,26 +1648,48 @@ export async function finalizeBroadcastStatus(
 
   const {
     count: total,
+    error: totalError,
   } = await db
     .from(
       'broadcast_recipients',
     )
-    .select('id', {
-      count: 'exact',
-      head: true,
-    })
+    .select(
+      'id',
+      {
+        count:
+          'exact',
+
+        head:
+          true,
+      },
+    )
     .eq(
       'broadcast_id',
       broadcastId,
     );
 
+  if (totalError) {
+    console.error(
+      '[broadcast-core] failed counting total recipients:',
+      totalError,
+    );
+
+    return;
+  }
+
+  const totalCount =
+    total ?? 0;
+
   const terminalStatus =
     failed > 0 &&
-    failed === (total ?? 0)
+    failed === totalCount
       ? 'failed'
       : 'sent';
 
-  await db
+  const {
+    error:
+      updateError,
+  } = await db
     .from('broadcasts')
     .update({
       status:
@@ -1308,4 +1702,28 @@ export async function finalizeBroadcastStatus(
       'id',
       broadcastId,
     );
+
+  if (updateError) {
+    console.error(
+      '[broadcast-core] failed finalizing broadcast:',
+      updateError,
+    );
+
+    return;
+  }
+
+  console.log(
+    '[broadcast-core] BROADCAST FINALIZED',
+    {
+      broadcastId,
+
+      status:
+        terminalStatus,
+
+      failed,
+
+      total:
+        totalCount,
+    },
+  );
 }

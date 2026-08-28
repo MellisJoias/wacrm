@@ -154,11 +154,6 @@ export function MessageComposer({
   const textareaRef =
     useRef<HTMLTextAreaElement>(null);
 
-  /*
-   * IMPORTANTE:
-   * readOnly precisa ser declarado antes dos useEffects
-   * que dependem dele.
-   */
   const canSend = useCan("send-messages");
   const readOnly = !canSend;
 
@@ -185,6 +180,88 @@ export function MessageComposer({
   }, []);
 
   // ------------------------------------------------------------------
+  // QUICK REPLY SLASH COMMAND
+  // ------------------------------------------------------------------
+
+  const [interactiveOpen, setInteractiveOpen] =
+    useState(false);
+
+  const [interactivePayload, setInteractivePayload] =
+    useState<InteractiveMessagePayload>(
+      blankButtonsPayload
+    );
+
+  const [savingQuickReply, setSavingQuickReply] =
+    useState(false);
+
+  const [quickReplyOpen, setQuickReplyOpen] =
+    useState(false);
+
+  const [quickReplyQuery, setQuickReplyQuery] =
+    useState("");
+
+  const [quickReplyCommandStart, setQuickReplyCommandStart] =
+    useState<number | null>(null);
+
+  /**
+   * Detecta o comando atual no textarea.
+   *
+   * Exemplo:
+   *
+   * /cadastro
+   *
+   * retorna:
+   *
+   * query = "cadastro"
+   * start = 0
+   *
+   * Em:
+   *
+   * "Olá /cadastro"
+   *
+   * retorna:
+   *
+   * query = "cadastro"
+   * start = 5
+   */
+  const updateQuickReplyCommand =
+    useCallback(
+      (
+        value: string,
+        cursorPosition: number
+      ) => {
+        const beforeCursor =
+          value.slice(0, cursorPosition);
+
+        const match =
+          beforeCursor.match(
+            /(?:^|\s)\/([^\s/]*)$/
+          );
+
+        if (!match) {
+          setQuickReplyOpen(false);
+          setQuickReplyQuery("");
+          setQuickReplyCommandStart(null);
+          return;
+        }
+
+        const query =
+          match[1] ?? "";
+
+        const slashIndex =
+          beforeCursor.lastIndexOf("/");
+
+        setQuickReplyQuery(query);
+        setQuickReplyCommandStart(
+          slashIndex
+        );
+
+        setQuickReplyOpen(true);
+      },
+      []
+    );
+
+  // ------------------------------------------------------------------
   // AUTO FOCUS AO TROCAR DE CONVERSA
   // ------------------------------------------------------------------
 
@@ -206,18 +283,10 @@ export function MessageComposer({
 
       const el = textareaRef.current;
 
-      if (!el) {
+      if (!el || el.disabled) {
         return;
       }
 
-      if (el.disabled) {
-        return;
-      }
-
-      /*
-       * O foco precisa ser feito diretamente no elemento
-       * que está montado para a conversa atual.
-       */
       el.focus();
 
       const length = el.value.length;
@@ -228,15 +297,10 @@ export function MessageComposer({
           length
         );
       } catch {
-        // Alguns browsers podem bloquear seleção.
+        // Ignora browsers sem suporte.
       }
     };
 
-    /*
-     * Usamos três frames porque a troca de conversa pode
-     * provocar mais de uma atualização/renderização antes
-     * do textarea estar pronto.
-     */
     frame1 = requestAnimationFrame(() => {
       frame2 = requestAnimationFrame(() => {
         frame3 = requestAnimationFrame(() => {
@@ -269,13 +333,6 @@ export function MessageComposer({
   // ------------------------------------------------------------------
   // PERMITIR DIGITAR IMEDIATAMENTE APÓS SELECIONAR A CONVERSA
   // ------------------------------------------------------------------
-  //
-  // Se o usuário selecionar uma conversa e começar a digitar
-  // antes do textarea receber o foco, capturamos a primeira
-  // tecla e direcionamos para o composer.
-  //
-  // Isso elimina a necessidade de clicar no campo de mensagem.
-  // ------------------------------------------------------------------
 
   useEffect(() => {
     if (sessionExpired || readOnly) {
@@ -292,10 +349,6 @@ export function MessageComposer({
         return;
       }
 
-      /*
-       * Se o usuário já está digitando em outro campo
-       * editável, não interferimos.
-       */
       const isEditable =
         target.tagName === "INPUT" ||
         target.tagName === "TEXTAREA" ||
@@ -306,12 +359,6 @@ export function MessageComposer({
         return;
       }
 
-      /*
-       * Não interferir em atalhos como:
-       * Ctrl + alguma tecla
-       * Cmd + alguma tecla
-       * Alt + alguma tecla
-       */
       if (
         e.ctrlKey ||
         e.metaKey ||
@@ -320,12 +367,6 @@ export function MessageComposer({
         return;
       }
 
-      /*
-       * Apenas caracteres reais.
-       *
-       * Backspace, Enter, setas, Escape etc. continuam
-       * sendo tratados normalmente pela aplicação.
-       */
       if (e.key.length !== 1) {
         return;
       }
@@ -336,27 +377,14 @@ export function MessageComposer({
         return;
       }
 
-      /*
-       * Impede a tecla de ser processada pelo elemento
-       * atualmente focado.
-       */
       e.preventDefault();
 
-      /*
-       * Coloca o foco no composer.
-       */
       el.focus();
 
-      /*
-       * Adiciona a primeira tecla diretamente ao estado.
-       */
       setText(
         (prev) => prev + e.key
       );
 
-      /*
-       * Ajusta altura e posiciona cursor no final.
-       */
       requestAnimationFrame(() => {
         adjustHeight();
 
@@ -399,24 +427,6 @@ export function MessageComposer({
     readOnly,
     adjustHeight,
   ]);
-
-  // ------------------------------------------------------------------
-  // INTERACTIVE MESSAGE
-  // ------------------------------------------------------------------
-
-  const [interactiveOpen, setInteractiveOpen] =
-    useState(false);
-
-  const [interactivePayload, setInteractivePayload] =
-    useState<InteractiveMessagePayload>(
-      blankButtonsPayload
-    );
-
-  const [savingQuickReply, setSavingQuickReply] =
-    useState(false);
-
-  const [quickReplyOpen, setQuickReplyOpen] =
-    useState(false);
 
   // ------------------------------------------------------------------
   // MEDIA
@@ -537,14 +547,14 @@ export function MessageComposer({
 
         setText("");
 
+        setQuickReplyOpen(false);
+        setQuickReplyQuery("");
+        setQuickReplyCommandStart(null);
+
         if (textareaRef.current) {
           textareaRef.current.style.height =
             "auto";
 
-          /*
-           * Mantém o foco depois do envio para permitir
-           * digitação contínua sem clicar novamente.
-           */
           requestAnimationFrame(() => {
             textareaRef.current?.focus();
           });
@@ -563,10 +573,130 @@ export function MessageComposer({
     ]
   );
 
+  // ------------------------------------------------------------------
+  // KEYBOARD SHORTCUTS
+  // ------------------------------------------------------------------
+
   const handleKeyDown = useCallback(
     (
       e: KeyboardEvent<HTMLTextAreaElement>
     ) => {
+      /*
+       * ESC fecha o seletor de respostas rápidas.
+       */
+      if (
+        e.key === "Escape" &&
+        quickReplyOpen
+      ) {
+        e.preventDefault();
+
+        setQuickReplyOpen(false);
+        setQuickReplyQuery("");
+        setQuickReplyCommandStart(null);
+
+        return;
+      }
+
+      /*
+       * ENTER seleciona a resposta rápida
+       * quando o seletor está aberto.
+       *
+       * O picker possui navegação própria,
+       * portanto não deixamos o Enter chegar
+       * ao envio normal.
+       */
+      if (
+        e.key === "Enter" &&
+        !e.shiftKey &&
+        quickReplyOpen
+      ) {
+        e.preventDefault();
+
+        return;
+      }
+
+      /*
+       * "/" inicia um comando de resposta rápida.
+       *
+       * Só funciona:
+       * - no início do texto
+       * - ou depois de espaço
+       *
+       * URLs não são afetadas.
+       */
+      if (
+        e.key === "/" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        const cursorPosition =
+          e.currentTarget.selectionStart ?? 0;
+
+        const beforeCursor =
+          e.currentTarget.value.slice(
+            0,
+            cursorPosition
+          );
+
+        const isCommandPosition =
+          beforeCursor.length === 0 ||
+          /\s$/.test(beforeCursor);
+
+        if (isCommandPosition) {
+          e.preventDefault();
+
+          const newText =
+            e.currentTarget.value.slice(
+              0,
+              cursorPosition
+            ) +
+            "/" +
+            e.currentTarget.value.slice(
+              cursorPosition
+            );
+
+          setText(newText);
+
+          setQuickReplyQuery("");
+          setQuickReplyCommandStart(
+            cursorPosition
+          );
+          setQuickReplyOpen(true);
+
+          requestAnimationFrame(() => {
+            const el =
+              textareaRef.current;
+
+            if (!el) {
+              return;
+            }
+
+            const nextPosition =
+              cursorPosition + 1;
+
+            el.focus();
+
+            try {
+              el.setSelectionRange(
+                nextPosition,
+                nextPosition
+              );
+            } catch {
+              // Ignora browsers sem suporte.
+            }
+
+            adjustHeight();
+          });
+
+          return;
+        }
+      }
+
+      /*
+       * Enter normal envia.
+       * Shift + Enter cria nova linha.
+       */
       if (
         e.key === "Enter" &&
         !e.shiftKey
@@ -576,18 +706,62 @@ export function MessageComposer({
         void handleSend();
       }
     },
-    [handleSend]
+    [
+      quickReplyOpen,
+      handleSend,
+      adjustHeight,
+    ]
   );
 
   const handleChange = useCallback(
     (
       e: React.ChangeEvent<HTMLTextAreaElement>
     ) => {
-      setText(e.target.value);
+      const value = e.target.value;
+
+      setText(value);
 
       adjustHeight();
+
+      const cursorPosition =
+        e.target.selectionStart ??
+        value.length;
+
+      if (quickReplyOpen) {
+        updateQuickReplyCommand(
+          value,
+          cursorPosition
+        );
+        return;
+      }
+
+      /*
+       * Também detecta o comando caso o texto
+       * tenha sido inserido por colagem.
+       */
+      const beforeCursor =
+        value.slice(
+          0,
+          cursorPosition
+        );
+
+      const match =
+        beforeCursor.match(
+          /(?:^|\s)\/([^\s/]*)$/
+        );
+
+      if (match) {
+        updateQuickReplyCommand(
+          value,
+          cursorPosition
+        );
+      }
     },
-    [adjustHeight]
+    [
+      adjustHeight,
+      quickReplyOpen,
+      updateQuickReplyCommand,
+    ]
   );
 
   // ------------------------------------------------------------------
@@ -660,6 +834,10 @@ export function MessageComposer({
         }
 
         setText(draftText);
+
+        setQuickReplyOpen(false);
+        setQuickReplyQuery("");
+        setQuickReplyCommandStart(null);
 
         requestAnimationFrame(() => {
           adjustHeight();
@@ -822,13 +1000,19 @@ export function MessageComposer({
   const handlePickQuickReply =
     useCallback(
       (qr: QuickReply) => {
-        setQuickReplyOpen(false);
-
+        /*
+         * Resposta interativa continua abrindo
+         * o builder.
+         */
         if (
           qr.kind ===
             "interactive" &&
           qr.interactive_payload
         ) {
+          setQuickReplyOpen(false);
+          setQuickReplyQuery("");
+          setQuickReplyCommandStart(null);
+
           openInteractiveBuilder(
             qr.interactive_payload
           );
@@ -838,6 +1022,76 @@ export function MessageComposer({
 
         const body =
           qr.content_text ?? "";
+
+        /*
+         * Se veio pelo comando "/",
+         * substituímos exatamente o comando.
+         */
+        if (
+          quickReplyCommandStart !== null
+        ) {
+          const el =
+            textareaRef.current;
+
+          const currentText =
+            text;
+
+          const cursorPosition =
+            el?.selectionStart ??
+            currentText.length;
+
+          const commandStart =
+            quickReplyCommandStart;
+
+          const newText =
+            currentText.slice(
+              0,
+              commandStart
+            ) +
+            body +
+            currentText.slice(
+              cursorPosition
+            );
+
+          setText(newText);
+
+          setQuickReplyOpen(false);
+          setQuickReplyQuery("");
+          setQuickReplyCommandStart(null);
+
+          requestAnimationFrame(() => {
+            adjustHeight();
+
+            const textarea =
+              textareaRef.current;
+
+            if (!textarea) {
+              return;
+            }
+
+            const nextPosition =
+              commandStart +
+              body.length;
+
+            textarea.focus();
+
+            try {
+              textarea.setSelectionRange(
+                nextPosition,
+                nextPosition
+              );
+            } catch {
+              // Ignora browsers sem suporte.
+            }
+          });
+
+          return;
+        }
+
+        /*
+         * Seleção pelo menu normal.
+         */
+        setQuickReplyOpen(false);
 
         setText((prev) =>
           prev &&
@@ -863,6 +1117,8 @@ export function MessageComposer({
         });
       },
       [
+        quickReplyCommandStart,
+        text,
         openInteractiveBuilder,
         adjustHeight,
       ]
@@ -1272,8 +1528,6 @@ export function MessageComposer({
         </div>
       )}
 
-      {/* Hidden file inputs */}
-
       <input
         ref={imageInputRef}
         type="file"
@@ -1381,8 +1635,6 @@ export function MessageComposer({
         </div>
       ) : (
         <div className="flex items-end gap-2">
-          {/* Attach menu */}
-
           <DropdownMenu>
             <DropdownMenuTrigger
               disabled={
@@ -1419,7 +1671,6 @@ export function MessageComposer({
                 }
               >
                 <ImageIcon className="mr-2 h-4 w-4" />
-
                 {t("photo")}
               </DropdownMenuItem>
 
@@ -1429,7 +1680,6 @@ export function MessageComposer({
                 }
               >
                 <Video className="mr-2 h-4 w-4" />
-
                 {t("video")}
               </DropdownMenuItem>
 
@@ -1439,7 +1689,6 @@ export function MessageComposer({
                 }
               >
                 <FileText className="mr-2 h-4 w-4" />
-
                 {t("document")}
               </DropdownMenuItem>
 
@@ -1449,13 +1698,10 @@ export function MessageComposer({
                 }
               >
                 <Mic className="mr-2 h-4 w-4" />
-
                 {t("voiceNote")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-
-          {/* + menu */}
 
           <DropdownMenu>
             <DropdownMenuTrigger
@@ -1488,21 +1734,19 @@ export function MessageComposer({
                 }
               >
                 <MessageSquareDashed className="mr-2 h-4 w-4" />
-
                 {t(
                   "interactiveMessage"
                 )}
               </DropdownMenuItem>
 
               <DropdownMenuItem
-                onClick={() =>
-                  setQuickReplyOpen(
-                    true
-                  )
-                }
+                onClick={() => {
+                  setQuickReplyCommandStart(null);
+                  setQuickReplyQuery("");
+                  setQuickReplyOpen(true);
+                }}
               >
                 <Zap className="mr-2 h-4 w-4" />
-
                 {t(
                   "quickReplies"
                 )}
@@ -1555,76 +1799,121 @@ export function MessageComposer({
             )}
           </GatedButton>
 
-          {/* ==========================================================
-              TEXTAREA
-              ========================================================== */}
-
-          <textarea
-            ref={textareaRef}
-            value={text}
-            onChange={handleChange}
-            onKeyDown={handleKeyDown}
-            onFocus={() => {
-              const el =
-                textareaRef.current;
-
-              if (!el) {
-                return;
+          <div className="relative flex min-w-0 flex-1">
+            <QuickReplyPicker
+              open={
+                quickReplyOpen
               }
+              onOpenChange={(
+                open
+              ) => {
+                setQuickReplyOpen(
+                  open
+                );
 
-              requestAnimationFrame(
-                () => {
-                  if (
-                    document.activeElement ===
-                    el
-                  ) {
-                    const length =
-                      el.value.length;
+                if (!open) {
+                  setQuickReplyQuery(
+                    ""
+                  );
+                  setQuickReplyCommandStart(
+                    null
+                  );
+                }
+              }}
+              onPick={
+                handlePickQuickReply
+              }
+              query={
+                quickReplyQuery
+              }
+              inline={
+                quickReplyCommandStart !==
+                null
+              }
+            />
 
-                    try {
-                      el.setSelectionRange(
-                        length,
-                        length
-                      );
-                    } catch {
-                      // Ignora browsers que não suportam seleção.
+            <textarea
+              ref={textareaRef}
+              value={text}
+              onChange={
+                handleChange
+              }
+              onKeyDown={
+                handleKeyDown
+              }
+              onFocus={() => {
+                const el =
+                  textareaRef.current;
+
+                if (!el) {
+                  return;
+                }
+
+                requestAnimationFrame(
+                  () => {
+                    if (
+                      document.activeElement ===
+                      el
+                    ) {
+                      /*
+                       * Não força o cursor para
+                       * o final se estivermos usando
+                       * o comando slash.
+                       */
+                      if (
+                        quickReplyOpen
+                      ) {
+                        return;
+                      }
+
+                      const length =
+                        el.value.length;
+
+                      try {
+                        el.setSelectionRange(
+                          length,
+                          length
+                        );
+                      } catch {
+                        // Ignora browsers sem suporte.
+                      }
                     }
                   }
-                }
-              );
-            }}
-            placeholder={
-              readOnly
-                ? t(
-                    "readOnlyPlaceholder"
-                  )
-                : sessionExpired
+                );
+              }}
+              placeholder={
+                readOnly
                   ? t(
-                      "sessionExpiredPlaceholder"
+                      "readOnlyPlaceholder"
                     )
-                  : t(
-                      "typeMessagePlaceholder"
+                  : sessionExpired
+                    ? t(
+                        "sessionExpiredPlaceholder"
+                      )
+                    : t(
+                        "typeMessagePlaceholder"
+                      )
+              }
+              disabled={
+                sessionExpired ||
+                readOnly
+              }
+              rows={1}
+              title={
+                readOnly
+                  ? t(
+                      "readOnlyTitle"
                     )
-            }
-            disabled={
-              sessionExpired ||
-              readOnly
-            }
-            rows={1}
-            title={
-              readOnly
-                ? t(
-                    "readOnlyTitle"
-                  )
-                : undefined
-            }
-            className={cn(
-              "flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50",
-              (sessionExpired ||
-                readOnly) &&
-                "cursor-not-allowed opacity-50"
-            )}
-          />
+                  : undefined
+              }
+              className={cn(
+                "flex-1 resize-none rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50",
+                (sessionExpired ||
+                  readOnly) &&
+                  "cursor-not-allowed opacity-50"
+              )}
+            />
+          </div>
 
           <GatedButton
             size="sm"
@@ -1650,8 +1939,6 @@ export function MessageComposer({
           {t("draftHint")}
         </p>
       )}
-
-      {/* Interactive-message builder */}
 
       <Dialog
         open={interactiveOpen}
@@ -1706,24 +1993,11 @@ export function MessageComposer({
               }
             >
               <Send className="mr-1 h-4 w-4" />
-
               {t("send")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
-
-      {/* Quick-reply picker */}
-
-      <QuickReplyPicker
-        open={quickReplyOpen}
-        onOpenChange={
-          setQuickReplyOpen
-        }
-        onPick={
-          handlePickQuickReply
-        }
-      />
     </div>
   );
 }

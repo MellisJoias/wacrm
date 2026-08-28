@@ -18,7 +18,6 @@ import { useRealtime } from "@/hooks/use-realtime";
 import { ConversationList } from "@/components/inbox/conversation-list";
 import { MessageThread } from "@/components/inbox/message-thread";
 import { ContactSidebar } from "@/components/inbox/contact-sidebar";
-import { toast } from "sonner";
 import { WifiOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -62,15 +61,13 @@ function InboxPageInner() {
    * Bumped whenever we want children (ConversationList, MessageThread)
    * to refetch from the DB — used as a safety net against missed
    * realtime events. Bumped on WS reconnect and on tab visibility →
-   * visible. The initial mount fetches don't depend on this; they fire
-   * once on conversationId-change as usual.
+   * visible.
    */
   const [resyncToken, setResyncToken] = useState(0);
 
   /**
    * Whether the desktop contact sidebar (tags / deals / notes) is shown.
-   * Defaults to `true` (the historical behaviour) and is restored from
-   * localStorage after mount.
+   * Defaults to `true` and is restored from localStorage after mount.
    */
   const [contactPanelOpen, setContactPanelOpen] = useState(true);
 
@@ -251,21 +248,34 @@ function InboxPageInner() {
         }
 
         if (knownConvIdsRef.current.has(newMsg.conversation_id)) {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === newMsg.conversation_id
-                ? {
-                    ...c,
-                    last_message_text: newMsg.content_text ?? "",
-                    last_message_at: newMsg.created_at,
-                    unread_count:
-                      activeConversation?.id === newMsg.conversation_id
-                        ? 0
-                        : c.unread_count + 1,
-                  }
-                : c
-            )
-          );
+          setConversations((prev) => {
+            const conversation = prev.find(
+              (c) => c.id === newMsg.conversation_id
+            );
+
+            if (!conversation) {
+              return prev;
+            }
+
+            const updatedConversation: Conversation = {
+              ...conversation,
+              last_message_text: newMsg.content_text ?? "",
+              last_message_at: newMsg.created_at,
+              unread_count:
+                activeConversation?.id === newMsg.conversation_id
+                  ? 0
+                  : conversation.unread_count + 1,
+            };
+
+            const withoutConversation = prev.filter(
+              (c) => c.id !== newMsg.conversation_id
+            );
+
+            return [
+              updatedConversation,
+              ...withoutConversation,
+            ];
+          });
         } else {
           hydrateConversation(newMsg.conversation_id);
         }
@@ -311,19 +321,32 @@ function InboxPageInner() {
         if (knownConvIdsRef.current.has(conv.id)) {
           const isActive = activeConversation?.id === conv.id;
 
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === conv.id
-                ? {
-                    ...c,
-                    ...conv,
-                    unread_count: isActive
-                      ? 0
-                      : conv.unread_count,
-                  }
-                : c
-            )
-          );
+          setConversations((prev) => {
+            const existing = prev.find(
+              (c) => c.id === conv.id
+            );
+
+            if (!existing) {
+              return [conv, ...prev];
+            }
+
+            const updatedConversation: Conversation = {
+              ...existing,
+              ...conv,
+              unread_count: isActive
+                ? 0
+                : conv.unread_count,
+            };
+
+            const withoutConversation = prev.filter(
+              (c) => c.id !== conv.id
+            );
+
+            return [
+              updatedConversation,
+              ...withoutConversation,
+            ];
+          });
         } else {
           hydrateConversation(conv.id);
         }
@@ -488,11 +511,6 @@ function InboxPageInner() {
    *
    * When a conversation is open, pressing Escape closes it just like
    * the back action in WhatsApp.
-   *
-   * We intentionally do not close the conversation when Escape is being
-   * handled inside an input, textarea or contenteditable element.
-   * This prevents an Escape used while editing text from unexpectedly
-   * navigating away from the conversation.
    */
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
@@ -547,6 +565,16 @@ function InboxPageInner() {
     []
   );
 
+  /**
+   * Called by MessageThread whenever a new message is added locally.
+   *
+   * Besides adding the message to the current thread, we also update
+   * the corresponding conversation and move it to position 0.
+   *
+   * This reproduces WhatsApp's behavior: when you send or receive a
+   * message, that conversation immediately moves to the top of the
+   * conversation list.
+   */
   const handleNewMessage = useCallback(
     (msg: Message) => {
       setMessages((prev) => {
@@ -555,6 +583,34 @@ function InboxPageInner() {
         }
 
         return [...prev, msg];
+      });
+
+      setConversations((prev) => {
+        const conversationIndex = prev.findIndex(
+          (c) => c.id === msg.conversation_id
+        );
+
+        if (conversationIndex === -1) {
+          return prev;
+        }
+
+        const conversation = prev[conversationIndex];
+
+        const updatedConversation: Conversation = {
+          ...conversation,
+          last_message_text: msg.content_text ?? "",
+          last_message_at: msg.created_at,
+          unread_count: 0,
+        };
+
+        const withoutConversation = prev.filter(
+          (c) => c.id !== msg.conversation_id
+        );
+
+        return [
+          updatedConversation,
+          ...withoutConversation,
+        ];
       });
     },
     []

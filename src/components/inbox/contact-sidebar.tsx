@@ -3,14 +3,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
-import { cn } from "@/lib/utils";
 import type { Contact, Deal, ContactNote, Tag } from "@/types";
 import {
   Phone,
   Mail,
   Copy,
   Check,
-  User,
   Tag as TagIcon,
   DollarSign,
   StickyNote,
@@ -25,6 +23,35 @@ interface ContactSidebarProps {
   contact: Contact | null;
 }
 
+/**
+ * Formata o telefone apenas para exibição.
+ *
+ * Exemplos:
+ * 5511950199413 -> +55 11 95019-9413
+ * 551195019941  -> +55 11 9501-9941
+ *
+ * O valor original não é alterado no banco nem na API.
+ */
+function formatPhoneDisplay(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+
+  // Brasil + DDD + celular com 9 dígitos
+  // 55 11 95019-9413
+  if (digits.length === 13 && digits.startsWith("55")) {
+    return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 9)}-${digits.slice(9)}`;
+  }
+
+  // Brasil + DDD + telefone com 8 dígitos
+  // 55 11 9501-9941
+  if (digits.length === 12 && digits.startsWith("55")) {
+    return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 8)}-${digits.slice(8)}`;
+  }
+
+  // Se não estiver em um formato reconhecido,
+  // mantém o valor original.
+  return phone;
+}
+
 export function ContactSidebar({ contact }: ContactSidebarProps) {
   const tSidebar = useTranslations("Inbox.sidebar");
   const tThread = useTranslations("Inbox.messageThread");
@@ -33,7 +60,9 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
   const [copied, setCopied] = useState(false);
   const [deals, setDeals] = useState<Deal[]>([]);
   const [notes, setNotes] = useState<ContactNote[]>([]);
-  const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>([]);
+  const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>(
+    []
+  );
   const [newNote, setNewNote] = useState("");
   const [addingNote, setAddingNote] = useState(false);
 
@@ -49,19 +78,27 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
         .select("*, stage:pipeline_stages(*)")
         .eq("contact_id", contact.id)
         .order("created_at", { ascending: false }),
+
       supabase
         .from("contact_notes")
         .select("*")
         .eq("contact_id", contact.id)
         .order("created_at", { ascending: false }),
+
       supabase
         .from("contact_tags")
         .select("id, tag_id, tags(*)")
         .eq("contact_id", contact.id),
     ]);
 
-    if (dealsRes.data) setDeals(dealsRes.data);
-    if (notesRes.data) setNotes(notesRes.data);
+    if (dealsRes.data) {
+      setDeals(dealsRes.data);
+    }
+
+    if (notesRes.data) {
+      setNotes(notesRes.data);
+    }
+
     if (tagsRes.data) {
       const mapped = tagsRes.data
         .filter((ct: Record<string, unknown>) => ct.tags)
@@ -69,12 +106,12 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
           ...(ct.tags as Tag),
           contact_tag_id: ct.id as string,
         }));
+
       setTags(mapped);
     }
   }, [contact]);
 
-  // Load on contact change. setContactData/setTags run inside async
-  // Supabase callbacks, not synchronously in the effect body.
+  // Load on contact change.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchContactData();
@@ -82,23 +119,29 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
 
   const handleCopyPhone = useCallback(async () => {
     if (!contact?.phone) return;
+
+    // Copia o número original, sem alterar o formato utilizado pelo sistema.
     await navigator.clipboard.writeText(contact.phone);
+
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-    // Dep is the whole `contact` object (not `contact?.phone`) so the
-    // React Compiler's inference agrees with the manual dep list —
-    // fixes the `preserve-manual-memoization` lint error.
+
+    setTimeout(() => {
+      setCopied(false);
+    }, 2000);
   }, [contact]);
 
   const handleAddNote = useCallback(async () => {
     if (!contact || !newNote.trim()) return;
     if (!accountId) return;
+
     setAddingNote(true);
 
     const supabase = createClient();
+
     const {
       data: { session },
     } = await supabase.auth.getSession();
+
     const user = session?.user;
 
     const { data, error } = await supabase
@@ -116,13 +159,16 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
       setNotes((prev) => [data, ...prev]);
       setNewNote("");
     }
+
     setAddingNote(false);
   }, [contact, newNote, accountId]);
 
   if (!contact) {
     return (
       <div className="flex h-full w-70 items-center justify-center border-l border-border bg-card">
-        <p className="text-sm text-muted-foreground">{tThread("selectConversation")}</p>
+        <p className="text-sm text-muted-foreground">
+          {tThread("selectConversation")}
+        </p>
       </div>
     );
   }
@@ -138,6 +184,7 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
           <div className="flex flex-col items-center text-center">
             <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted text-lg font-semibold text-foreground">
               {contact.avatar_url ? (
+                // eslint-disable-next-line @next/next/no-img-element
                 <img
                   src={contact.avatar_url}
                   alt={displayName}
@@ -147,11 +194,15 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
                 initials
               )}
             </div>
+
             <h3 className="mt-3 text-sm font-semibold text-foreground">
               {displayName}
             </h3>
+
             {contact.company && (
-              <p className="text-xs text-muted-foreground">{contact.company}</p>
+              <p className="text-xs text-muted-foreground">
+                {contact.company}
+              </p>
             )}
           </div>
 
@@ -162,7 +213,11 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
               className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
             >
               <Phone className="h-4 w-4 text-muted-foreground" />
-              <span className="flex-1 text-left">{contact.phone}</span>
+
+              <span className="flex-1 text-left">
+                {formatPhoneDisplay(contact.phone)}
+              </span>
+
               {copied ? (
                 <Check className="h-3 w-3 text-primary" />
               ) : (
@@ -173,7 +228,10 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
             {contact.email && (
               <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-muted-foreground">
                 <Mail className="h-4 w-4 text-muted-foreground" />
-                <span className="truncate">{contact.email}</span>
+
+                <span className="truncate">
+                  {contact.email}
+                </span>
               </div>
             )}
           </div>
@@ -185,11 +243,15 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
           <div>
             <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
               <TagIcon className="h-3 w-3" />
+
               {tSidebar("tags")}
             </div>
+
             <div className="mt-2 flex flex-wrap gap-1">
               {tags.length === 0 ? (
-                <p className="px-1 text-xs text-muted-foreground">{tSidebar("noTags")}</p>
+                <p className="px-1 text-xs text-muted-foreground">
+                  {tSidebar("noTags")}
+                </p>
               ) : (
                 tags.map((tag) => (
                   <span
@@ -214,11 +276,15 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
           <div>
             <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
               <DollarSign className="h-3 w-3" />
+
               {tSidebar("deals")}
             </div>
+
             <div className="mt-2 space-y-2">
               {deals.length === 0 ? (
-                <p className="px-1 text-xs text-muted-foreground">{tSidebar("noDeals")}</p>
+                <p className="px-1 text-xs text-muted-foreground">
+                  {tSidebar("noDeals")}
+                </p>
               ) : (
                 deals.map((deal) => (
                   <div
@@ -228,11 +294,13 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
                     <p className="text-sm font-medium text-foreground">
                       {deal.title}
                     </p>
+
                     <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
                       <span>
                         {deal.currency ?? "$"}
                         {deal.value.toLocaleString()}
                       </span>
+
                       {deal.stage && (
                         <span
                           className="rounded-full px-1.5 py-0.5 text-[10px]"
@@ -258,8 +326,10 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
           <div>
             <div className="flex items-center gap-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">
               <StickyNote className="h-3 w-3" />
+
               {tSidebar("notes")}
             </div>
+
             <div className="mt-2">
               <div className="flex gap-2">
                 <textarea
@@ -269,6 +339,7 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
                   rows={2}
                   className="flex-1 resize-none rounded-lg border border-border bg-muted px-3 py-2 text-xs text-foreground placeholder-muted-foreground outline-none focus:border-primary/50"
                 />
+
                 <Button
                   size="sm"
                   className="h-auto bg-primary px-2 hover:bg-primary/90"
@@ -288,8 +359,12 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
                     <p className="whitespace-pre-wrap text-xs text-muted-foreground">
                       {note.note_text}
                     </p>
+
                     <p className="mt-1 text-[10px] text-muted-foreground">
-                      {format(new Date(note.created_at), "MMM d, yyyy HH:mm")}
+                      {format(
+                        new Date(note.created_at),
+                        "MMM d, yyyy HH:mm"
+                      )}
                     </p>
                   </div>
                 ))}

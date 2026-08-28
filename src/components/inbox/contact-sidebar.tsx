@@ -24,31 +24,32 @@ interface ContactSidebarProps {
 }
 
 /**
- * Formata o telefone apenas para exibição.
+ * Formata números de telefone brasileiros para exibição.
  *
  * Exemplos:
  * 5511950199413 -> +55 11 95019-9413
  * 551195019941  -> +55 11 9501-9941
  *
- * O valor original não é alterado no banco nem na API.
+ * Essa função altera somente a apresentação do número.
+ * O valor original armazenado no banco continua intacto.
  */
 function formatPhoneDisplay(phone: string): string {
   const digits = phone.replace(/\D/g, "");
 
   // Brasil + DDD + celular com 9 dígitos
-  // 55 11 95019-9413
+  // Exemplo: 55 11 95019-9413
   if (digits.length === 13 && digits.startsWith("55")) {
     return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 9)}-${digits.slice(9)}`;
   }
 
-  // Brasil + DDD + telefone com 8 dígitos
-  // 55 11 9501-9941
+  // Brasil + DDD + telefone fixo com 8 dígitos
+  // Exemplo: 55 11 9501-9941
   if (digits.length === 12 && digits.startsWith("55")) {
     return `+55 ${digits.slice(2, 4)} ${digits.slice(4, 8)}-${digits.slice(8)}`;
   }
 
-  // Se não estiver em um formato reconhecido,
-  // mantém o valor original.
+  // Caso o número não esteja em um formato reconhecido,
+  // mantém exatamente o valor original.
   return phone;
 }
 
@@ -57,12 +58,13 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
   const tThread = useTranslations("Inbox.messageThread");
 
   const { accountId } = useAuth();
+
   const [copied, setCopied] = useState(false);
   const [deals, setDeals] = useState<Deal[]>([]);
   const [notes, setNotes] = useState<ContactNote[]>([]);
-  const [tags, setTags] = useState<(Tag & { contact_tag_id: string })[]>(
-    []
-  );
+  const [tags, setTags] = useState<
+    (Tag & { contact_tag_id: string })[]
+  >([]);
   const [newNote, setNewNote] = useState("");
   const [addingNote, setAddingNote] = useState(false);
 
@@ -117,11 +119,19 @@ export function ContactSidebar({ contact }: ContactSidebarProps) {
     fetchContactData();
   }, [fetchContactData]);
 
+  /**
+   * Copia o telefone já formatado visualmente.
+   *
+   * Exemplo:
+   * Banco: 5511950199413
+   * Copiado: +55 11 95019-9413
+   */
   const handleCopyPhone = useCallback(async () => {
     if (!contact?.phone) return;
 
-    // Copia o número original, sem alterar o formato utilizado pelo sistema.
-    await navigator.clipboard.writeText(contact.phone);
+    const formattedPhone = formatPhoneDisplay(contact.phone);
+
+    await navigator.clipboard.writeText(formattedPhone);
 
     setCopied(true);
 

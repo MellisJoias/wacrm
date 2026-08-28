@@ -84,8 +84,10 @@ function formatDateSeparator(
   t: ReturnType<typeof useTranslations>,
 ): string {
   const date = new Date(dateStr);
+
   if (isToday(date)) return t("today");
   if (isYesterday(date)) return t("yesterday");
+
   return format(date, "MMMM d, yyyy");
 }
 
@@ -98,6 +100,7 @@ function groupMessagesByDate(messages: Message[]) {
 
     if (day !== currentDate) {
       currentDate = day;
+
       groups.push({
         date: msg.created_at,
         messages: [msg],
@@ -115,8 +118,16 @@ const STATUS_OPTIONS: {
   value: ConversationStatus;
   color: string;
 }[] = [
-  { label: "Open", value: "open", color: "text-primary" },
-  { label: "Pending", value: "pending", color: "text-amber-400" },
+  {
+    label: "Open",
+    value: "open",
+    color: "text-primary",
+  },
+  {
+    label: "Pending",
+    value: "pending",
+    color: "text-amber-400",
+  },
   {
     label: "Closed",
     value: "closed",
@@ -151,12 +162,15 @@ export function MessageThread({
 
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [reactions, setReactions] = useState<MessageReaction[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   useEffect(() => {
     return () => {
@@ -440,31 +454,25 @@ export function MessageThread({
   }, [conversationId]);
 
   /*
-   * Escape closes the currently selected conversation.
+   * Escape fecha a conversa atual.
    *
-   * Capture phase is intentional: it makes the shortcut work even when
-   * focus is inside the message area or another child component.
+   * IMPORTANTE:
+   * Não bloqueamos mais o Escape quando o foco está no
+   * INPUT/TEXTAREA/contenteditable.
    *
-   * We don't close the conversation while the user is editing text in an
-   * input/textarea/contenteditable element, and we allow open dialogs and
-   * dropdowns to consume Escape first.
+   * Portanto:
+   * - digitando -> ESC fecha a conversa
+   * - clicando na conversa -> ESC fecha
+   * - cursor no campo de mensagem -> ESC fecha
+   *
+   * Se existir um Dialog/Dropdown/Popover do Radix aberto,
+   * deixamos o componente consumir o Escape primeiro.
    */
   useEffect(() => {
     if (!conversation || !onBack) return;
 
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-
-      const target = event.target as HTMLElement | null;
-
-      if (
-        target?.tagName === "INPUT" ||
-        target?.tagName === "TEXTAREA" ||
-        target?.tagName === "SELECT" ||
-        target?.isContentEditable
-      ) {
-        return;
-      }
 
       const activeOverlay = document.querySelector(
         '[role="dialog"], [data-radix-popper-content-wrapper], [data-radix-menu-content]',

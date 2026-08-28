@@ -65,6 +65,7 @@ const ROLE_CHIP: Record<
       "border-border bg-card text-muted-foreground",
   },
 };
+
 import {
   Avatar,
   AvatarFallback,
@@ -119,6 +120,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
   const { profile, profileLoading, account, accountRole, signOut } = useAuth();
   const totalUnread = useTotalUnread();
   const unreadNotifications = useUnreadNotifications();
+
   // Only surface the account-name strip when it actually carries
   // information. A solo user's personal account is named after them
   // (the 017 signup trigger seeds it from `full_name`), so showing it
@@ -146,10 +148,13 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
     if (!open) return;
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose?.();
     };
+
     window.addEventListener("keydown", onKey);
+
     return () => {
       document.body.style.overflow = prev;
       window.removeEventListener("keydown", onKey);
@@ -188,13 +193,14 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
             close button is hidden since the sidebar is always-visible. */}
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
           <Link href="/dashboard" className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <MessageSquare className="h-4 w-4" />
-            </div>
+            {/* Logo: somente o balão esmeralda, sem fundo */}
+            <MessageSquare className="h-7 w-7 text-primary" />
+
             <span className="text-sm font-semibold text-foreground">
               {t("title")}
             </span>
           </Link>
+
           <button
             type="button"
             onClick={onClose}
@@ -236,7 +242,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                     )}
                   >
                     <item.icon className="h-4 w-4" />
-                    <span className="flex-1">{t(item.labelKey as string)}</span>
+
+                    <span className="flex-1">
+                      {t(item.labelKey as string)}
+                    </span>
+
                     {item.beta && (
                       <span
                         aria-label={t("beta")}
@@ -245,21 +255,29 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                         {t("beta")}
                       </span>
                     )}
+
                     {showUnreadDot && (
                       <span
-                        aria-label={t("unreadConversations", { count: totalUnread })}
+                        aria-label={t("unreadConversations", {
+                          count: totalUnread,
+                        })}
                         className="relative flex h-2 w-2"
                       >
                         <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
                         <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
                       </span>
                     )}
+
                     {showNotificationBadge && (
                       <span
-                        aria-label={t("unreadNotifications", { count: unreadNotifications })}
+                        aria-label={t("unreadNotifications", {
+                          count: unreadNotifications,
+                        })}
                         className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold text-primary-foreground"
                       >
-                        {unreadNotifications > 9 ? "9+" : unreadNotifications}
+                        {unreadNotifications > 9
+                          ? "9+"
+                          : unreadNotifications}
                       </span>
                     )}
                   </Link>
@@ -273,6 +291,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
           <ul className="flex flex-col gap-1">
             {bottomNavItems.map((item) => {
               const isActive = pathname.startsWith(item.href);
+
               return (
                 <li key={item.href}>
                   <Link
@@ -304,32 +323,32 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
           {showAccountStrip && account?.name ? (
             <div className="mb-2 flex items-center gap-2 px-3 text-xs text-muted-foreground">
               <UsersRound className="size-3.5 shrink-0" />
+
               {/* `title=` exposes the full name on hover when it
                   gets truncated (long account names + narrow
                   sidebars). Cheap a11y win. */}
               <span className="truncate" title={account.name}>
                 {account.name}
               </span>
-              {accountRole ? (
-                // Always render the chip — owners used to be
-                // invisible here, which made them indistinguishable
-                // from admins at a glance. Now everyone sees their
-                // role (with a colour cue) regardless of tier.
-                (() => {
-                  const meta = ROLE_CHIP[accountRole];
-                  const Icon = meta.icon;
-                  return (
-                    <span
-                      className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${meta.className}`}
-                    >
-                      <Icon className="size-3" />
-                      {t(meta.labelKey as string)}
-                    </span>
-                  );
-                })()
-              ) : null}
+
+              {accountRole
+                ? (() => {
+                    const meta = ROLE_CHIP[accountRole];
+                    const Icon = meta.icon;
+
+                    return (
+                      <span
+                        className={`ml-auto inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${meta.className}`}
+                      >
+                        <Icon className="size-3" />
+                        {t(meta.labelKey as string)}
+                      </span>
+                    );
+                  })()
+                : null}
             </div>
           ) : null}
+
           <DropdownMenu>
             <DropdownMenuTrigger className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted/60 focus:bg-muted/60 focus:outline-none data-popup-open:bg-muted/60">
               <Avatar className="size-8 shrink-0">
@@ -339,21 +358,25 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                     alt={profile.full_name ?? t("defaultAvatar")}
                   />
                 ) : null}
+
                 <AvatarFallback className="bg-primary/10 text-sm font-medium text-primary">
                   {profile?.full_name?.charAt(0)?.toUpperCase() ??
                     profile?.email?.charAt(0)?.toUpperCase() ??
                     "U"}
                 </AvatarFallback>
               </Avatar>
+
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-medium text-foreground">
                   {profile?.full_name ?? t("defaultUser")}
                 </p>
+
                 <p className="truncate text-xs text-muted-foreground">
                   {profile?.email ?? ""}
                 </p>
               </div>
             </DropdownMenuTrigger>
+
             <DropdownMenuContent
               align="end"
               side="top"
@@ -372,6 +395,7 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                 <User className="size-4" />
                 {t("menuProfile")}
               </DropdownMenuItem>
+
               <DropdownMenuItem
                 render={
                   <Link
@@ -384,7 +408,9 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
                 <Settings className="size-4" />
                 {t("menuSettings")}
               </DropdownMenuItem>
+
               <DropdownMenuSeparator className="bg-border" />
+
               <DropdownMenuItem
                 onClick={signOut}
                 className="text-popover-foreground focus:bg-accent focus:text-accent-foreground"

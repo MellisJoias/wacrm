@@ -27,13 +27,9 @@ export function useRealtime({
   const channelRef = useRef<RealtimeChannel | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
-  // Store latest callbacks in refs to avoid re-subscribing when the
-  // parent re-renders with fresh closures. Assigned inside an effect
-  // so the mutation doesn't happen during render (React 19's refs
-  // rule) — subscribers only read `.current` inside async Realtime
-  // callbacks, which always run after the render that updates it.
   const onMessageRef = useRef(onMessageEvent);
   const onConversationRef = useRef(onConversationEvent);
+
   useEffect(() => {
     onMessageRef.current = onMessageEvent;
     onConversationRef.current = onConversationEvent;
@@ -48,21 +44,51 @@ export function useRealtime({
       .channel(channelName)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "messages" },
+        {
+          event: "*",
+          schema: "public",
+          table: "messages",
+        },
         (payload) => {
-          onMessageRef.current?.({
-            eventType: payload.eventType as RealtimeEvent<Message>["eventType"],
+          const event = {
+            eventType:
+              payload.eventType as RealtimeEvent<Message>["eventType"],
             new: payload.new as Message,
             old: payload.old as Partial<Message>,
-          });
+          };
+
+          /*
+           * Dispara um evento global para o sistema de notificações.
+           *
+           * Apenas INSERT gera notificação.
+           * UPDATE normalmente corresponde a status da mensagem
+           * (sent/delivered/read) e não deve gerar nova notificação.
+           */
+          if (
+            event.eventType === "INSERT" &&
+            typeof window !== "undefined"
+          ) {
+            window.dispatchEvent(
+              new CustomEvent("wacrm:incoming-message", {
+                detail: event.new,
+              })
+            );
+          }
+
+          onMessageRef.current?.(event);
         }
       )
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "conversations" },
+        {
+          event: "*",
+          schema: "public",
+          table: "conversations",
+        },
         (payload) => {
           onConversationRef.current?.({
-            eventType: payload.eventType as RealtimeEvent<Conversation>["eventType"],
+            eventType:
+              payload.eventType as RealtimeEvent<Conversation>["eventType"],
             new: payload.new as Conversation,
             old: payload.old as Partial<Conversation>,
           });
@@ -84,11 +110,15 @@ export function useRealtime({
   const unsubscribe = useCallback(() => {
     if (channelRef.current) {
       const supabase = createClient();
+
       supabase.removeChannel(channelRef.current);
       channelRef.current = null;
       setIsConnected(false);
     }
   }, []);
 
-  return { isConnected, unsubscribe };
+  return {
+    isConnected,
+    unsubscribe,
+  };
 }

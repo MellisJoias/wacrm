@@ -6,6 +6,7 @@ import Script from "next/script";
 import "./globals.css";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ThemedToaster } from "@/components/themed-toaster";
+import { IncomingMessageNotifications } from "@/components/incoming-message-notifications";
 import {
   DEFAULT_MODE,
   DEFAULT_THEME,
@@ -45,13 +46,6 @@ export const viewport: Viewport = {
   colorScheme: "dark light",
 };
 
-// Inline boot script — runs before React hydrates so the user's
-// chosen accent (data-theme) AND mode (data-mode) are on the <html>
-// element before first paint.
-//
-// Legacy "violet" is migrated to "emerald" before the first paint.
-// This prevents the old theme from being reapplied by the boot script.
-
 const THEME_BOOT_SCRIPT = `
 (function(){
   var d = document.documentElement;
@@ -62,7 +56,6 @@ const THEME_BOOT_SCRIPT = `
     var THEMES = ${JSON.stringify(THEME_IDS)};
     var savedTheme = localStorage.getItem(THEME_KEY);
 
-    // Migrate legacy "violet" theme to "emerald".
     if (savedTheme === "violet") {
       savedTheme = "emerald";
       localStorage.setItem(THEME_KEY, savedTheme);
@@ -104,10 +97,6 @@ export default async function RootLayout({
       data-theme={DEFAULT_THEME}
       data-mode={DEFAULT_MODE}
       className={`${inter.variable} h-full antialiased`}
-      // The `theme-boot` script below rewrites `data-theme` and
-      // `data-mode` on <html> from localStorage before React hydrates,
-      // so for any non-default choice the client DOM intentionally
-      // differs from the server-rendered defaults.
       suppressHydrationWarning
     >
       <head>
@@ -121,9 +110,15 @@ export default async function RootLayout({
       </head>
 
       <body className="min-h-full bg-background text-foreground font-sans">
-        <NextIntlClientProvider messages={messages} locale={locale}>
+        <NextIntlClientProvider
+          messages={messages}
+          locale={locale}
+        >
           <ThemeProvider>
             {children}
+
+            <IncomingMessageNotifications />
+
             <ThemedToaster />
           </ThemeProvider>
         </NextIntlClientProvider>

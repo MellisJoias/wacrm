@@ -1,7 +1,11 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import type { Message, MessageReaction } from "@/types";
+import type {
+  Message,
+  MessageReaction,
+  ContactCard,
+} from "@/types";
 import {
   Clock,
   Check,
@@ -66,37 +70,30 @@ function StatusIcon({ status }: { status: Message["status"] }) {
   }
 }
 
-function ContactCard({
-  message,
+function ContactCardItem({
+  contact,
 }: {
-  message: Message;
+  contact: ContactCard;
 }) {
-  const payload = message.contact_payload;
-
-  if (!payload) {
-    return (
-      <div className="flex items-center gap-2 text-sm">
-        <UserRound className="h-5 w-5 shrink-0" />
-
-        <span>
-          {message.content_text || "Contato compartilhado"}
-        </span>
-      </div>
-    );
-  }
-
   const name =
-    payload.name?.formatted_name ||
-    [payload.name?.first_name, payload.name?.last_name]
+    contact.name?.formatted_name ||
+    [
+      contact.name?.first_name,
+      contact.name?.middle_name,
+      contact.name?.last_name,
+    ]
       .filter(Boolean)
       .join(" ") ||
-    message.content_text ||
     "Contato";
 
-  const phone = payload.phones?.[0]?.phone;
-  const email = payload.emails?.[0]?.email;
-  const company = payload.org?.company;
-  const title = payload.org?.title;
+  const phone =
+    contact.phones?.[0]?.phone ||
+    contact.phones?.[0]?.wa_id;
+
+  const email = contact.emails?.[0]?.email;
+
+  const company = contact.org?.company;
+  const title = contact.org?.title;
 
   const initials = name
     .split(" ")
@@ -191,6 +188,41 @@ function ContactCard({
           Contato compartilhado pelo WhatsApp
         </span>
       </div>
+    </div>
+  );
+}
+
+function ContactCard({
+  message,
+}: {
+  message: Message;
+}) {
+  const payload = message.contact_card;
+
+  if (!payload) {
+    return (
+      <div className="flex items-center gap-2 text-sm">
+        <UserRound className="h-5 w-5 shrink-0" />
+
+        <span>
+          {message.content_text || "Contato compartilhado"}
+        </span>
+      </div>
+    );
+  }
+
+  const contacts = Array.isArray(payload)
+    ? payload
+    : [payload];
+
+  return (
+    <div className="flex flex-col gap-2">
+      {contacts.map((contact, index) => (
+        <ContactCardItem
+          key={`${message.id}-contact-${index}`}
+          contact={contact}
+        />
+      ))}
     </div>
   );
 }
@@ -315,7 +347,6 @@ function MessageContent({
             )}
           >
             <LayoutTemplate className="h-3 w-3" />
-
             {t("template")}
           </span>
 
@@ -346,16 +377,15 @@ function MessageContent({
       );
 
     case "contact":
-    case "contacts":
-      return (
-        <ContactCard message={message} />
-      );
+      return <ContactCard message={message} />;
 
     case "interactive": {
       if (message.interactive_payload) {
         return (
           <InteractivePreview
-            payload={message.interactive_payload}
+            payload={
+              message.interactive_payload
+            }
           />
         );
       }
@@ -365,7 +395,6 @@ function MessageContent({
           <div className="flex flex-col gap-0.5">
             <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
               <CornerDownLeft className="h-3 w-3" />
-
               {t("buttonReply")}
             </span>
 
@@ -460,7 +489,6 @@ export function MessageBubble({
               title={t("aiBadgeTitle")}
             >
               <Sparkles className="h-2.5 w-2.5" />
-
               {t("aiBadge")}
             </span>
           )}
@@ -489,8 +517,12 @@ export function MessageBubble({
         onToggleReaction && (
           <MessageReactions
             reactions={reactions}
-            currentUserId={currentUserId}
-            onToggle={onToggleReaction}
+            currentUserId={
+              currentUserId
+            }
+            onToggle={
+              onToggleReaction
+            }
           />
         )}
     </div>

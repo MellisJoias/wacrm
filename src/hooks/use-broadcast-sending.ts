@@ -285,6 +285,23 @@ async function resolveCustomFieldAudience(
   return data ?? [];
 }
 
+/**
+ * Resolve os contatos vindos de um CSV.
+ *
+ * Regra:
+ *
+ * 1. Normaliza os telefones.
+ * 2. Procura os contatos existentes na conta usando
+ *    phone_normalized.
+ * 3. Se o contato já existir, REUTILIZA o contato.
+ * 4. Se não existir, cria um novo contato.
+ * 5. Nunca cria um segundo contato para o mesmo telefone.
+ *
+ * Isso é importante porque o banco possui uma restrição
+ * UNIQUE baseada em:
+ *
+ * account_id + phone_normalized
+ */
 async function upsertCsvContacts(
   supabase: ReturnType<typeof createClient>,
   accountId: string,
@@ -298,6 +315,10 @@ async function upsertCsvContacts(
     return [];
   }
 
+  // ============================================================
+  // 1. NORMALIZAR E DEDUPLICAR O CSV
+  // ============================================================
+
   const uniqueByPhone = new Map<
     string,
     {
@@ -307,22 +328,21 @@ async function upsertCsvContacts(
   >();
 
   for (const row of csvRows) {
-    const phone = row.phone.replace(
-      /\D/g,
-      '',
-    );
+    const phone = row.phone
+      .replace(/\D/g, '')
+      .trim();
 
     if (!phone) {
       continue;
     }
 
-    uniqueByPhone.set(
-      phone,
-      {
+    // Mantém a primeira ocorrência.
+    if (!uniqueByPhone.has(phone)) {
+      uniqueByPhone.set(phone, {
         ...row,
         phone,
-      },
-    );
+      });
+    }
   }
 
   const phones = [
@@ -333,20 +353,35 @@ async function upsertCsvContacts(
     return [];
   }
 
+  // ============================================================
+  // 2. BUSCAR CONTATOS EXISTENTES DA CONTA
+  //
+  // Não usamos mais:
+  //
+  // .eq('user_id', userId)
+  // .in('phone', phones)
+  //
+  // porque a restrição do banco é baseada em
+  // account_id + phone_normalized.
+  // ============================================================
+
   const {
     data: existing,
     error: lookupErr,
   } = await supabase
     .from('contacts')
     .select('*')
-    .eq('user_id', userId)
-    .in('phone', phones);
+    .eq('account_id', accountId);
 
   if (lookupErr) {
     throw new Error(
       `Failed to look up CSV contacts: ${lookupErr.message}`,
     );
   }
+
+  // ============================================================
+  // 3. INDEXAR CONTATOS EXISTENTES PELO TELEFONE NORMALIZADO
+  // ============================================================
 
   const byPhone = new Map<
     string,
@@ -356,16 +391,24 @@ async function upsertCsvContacts(
   for (const contact of (
     existing ?? []
   ) as Contact[]) {
-    if (contact.phone) {
+    const normalized =
+      contact.phone_normalized ||
+      contact.phone?.replace(/\D/g, '');
+
+    if (normalized) {
       byPhone.set(
-        contact.phone.replace(
-          /\D/g,
-          '',
-        ),
+        normalized,
         contact,
       );
     }
   }
+
+  // ============================================================
+  // 4. SE JÁ EXISTE, NÃO CRIAR
+  //
+  // O contato existente permanece no byPhone e será retornado
+  // no final da função para participar normalmente da campanha.
+  // ============================================================
 
   const missing = phones
     .filter(
@@ -379,6 +422,10 @@ async function upsertCsvContacts(
         uniqueByPhone.get(phone)
           ?.name ?? null,
     }));
+
+  // ============================================================
+  // 5. CRIAR SOMENTE OS CONTATOS AUSENTES
+  // ============================================================
 
   const INSERT_CHUNK = 200;
 
@@ -401,25 +448,92 @@ async function upsertCsvContacts(
       .select();
 
     if (insertErr) {
+      /*
+       * Pode acontecer uma condição de corrida:
+       *
+       * 1. A consulta acima verifica que o telefone não existe.
+       * 2. Outro processo cria o mesmo telefone.
+       * 3. Nosso INSERT chega depois.
+       *
+       * Nesse caso, o banco retorna 23505.
+       *
+       * Em vez de quebrar a campanha, fazemos uma nova leitura
+       * e reutilizamos os contatos existentes.
+       */
+
+      if (
+        insertErr.code === '23505' ||
+        insertErr.message.includes(
+          'idx_contacts_account_phone_normalized',
+        )
+      ) {
+        const {
+          data: refreshed,
+          error: refreshErr,
+        } = await supabase
+          .from('contacts')
+          .select('*')
+          .eq('account_id', accountId);
+
+        if (refreshErr) {
+          throw new Error(
+            `Failed to refresh CSV contacts: ${refreshErr.message}`,
+          );
+        }
+
+        for (const contact of (
+          refreshed ?? []
+        ) as Contact[]) {
+          const normalized =
+            contact.phone_normalized ||
+            contact.phone?.replace(/\D/g, '');
+
+          if (normalized) {
+            byPhone.set(
+              normalized,
+              contact,
+            );
+          }
+        }
+
+        continue;
+      }
+
       throw new Error(
         `Failed to create CSV contacts: ${insertErr.message}`,
       );
     }
 
+    // ==========================================================
+    // 6. ADICIONAR OS NOVOS CONTATOS AO MAPA
+    // ==========================================================
+
     for (const contact of (
       inserted ?? []
     ) as Contact[]) {
-      if (contact.phone) {
+      const normalized =
+        contact.phone_normalized ||
+        contact.phone?.replace(/\D/g, '');
+
+      if (normalized) {
         byPhone.set(
-          contact.phone.replace(
-            /\D/g,
-            '',
-          ),
+          normalized,
           contact,
         );
       }
     }
   }
+
+  // ============================================================
+  // 7. RETORNAR TODOS OS CONTATOS
+  //
+  // Aqui estarão:
+  //
+  // - contatos que já existiam
+  // - contatos recém-criados
+  //
+  // Portanto, ambos seguem para o disparo.
+  // ============================================================
 
   return phones
     .map((phone) =>

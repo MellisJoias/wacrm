@@ -57,21 +57,6 @@ type CustomValueIndex = Map<
  * ============================================================
  * NORMALIZAÇÃO DE TELEFONE
  * ============================================================
- *
- * Mantém somente números.
- *
- * Para números brasileiros:
- *
- * 11999999999
- * -> 5511999999999
- *
- * 5511999999999
- * -> 5511999999999
- *
- * 1199999999
- * -> 5511999999999
- *
- * Também aceita números internacionais já completos.
  */
 function normalizePhone(
   value: string | null | undefined,
@@ -125,13 +110,21 @@ function normalizePhone(
     )}9${phone.slice(2)}`;
   }
 
-  // Para números internacionais que já chegaram completos,
-  // preservamos o valor.
+  // Números internacionais já completos.
   return phone;
 }
 
 /**
- * Resolve as variáveis do template para um contato específico.
+ * ============================================================
+ * RESOLVE VARIÁVEIS
+ * ============================================================
+ *
+ * Resolve:
+ *
+ * {{1}} -> static
+ * {{1}} -> field
+ * {{1}} -> custom_field
+ * {{1}} -> CSV
  *
  * A ordem é numérica:
  *
@@ -165,8 +158,12 @@ export function resolveVariables(
   return keys.map((key) => {
     const variable = variables[key];
 
+    if (!variable) {
+      return '';
+    }
+
     if (variable.type === 'static') {
-      return variable.value;
+      return variable.value ?? '';
     }
 
     if (variable.type === 'field') {
@@ -183,6 +180,20 @@ export function resolveVariables(
       return fieldMap[variable.value] ?? '';
     }
 
+    /**
+     * --------------------------------------------------------
+     * CSV
+     * --------------------------------------------------------
+     *
+     * IMPORTANTE:
+     *
+     * Se a configuração for:
+     *
+     * {{1}} -> CSV -> name
+     *
+     * o valor vem EXCLUSIVAMENTE da linha correspondente
+     * do CSV.
+     */
     if (variable.type === 'csv') {
       switch (variable.value) {
         case 'name':
@@ -198,7 +209,9 @@ export function resolveVariables(
 
     if (variable.type === 'custom_field') {
       return (
-        customValues?.get(variable.value) ?? ''
+        customValues?.get(
+          variable.value,
+        ) ?? ''
       );
     }
 
@@ -207,7 +220,9 @@ export function resolveVariables(
 }
 
 /**
- * Carrega os valores dos campos personalizados em memória.
+ * ============================================================
+ * CARREGA CAMPOS PERSONALIZADOS
+ * ============================================================
  */
 async function fetchCustomValueIndex(
   supabase: ReturnType<typeof createClient>,
@@ -231,12 +246,18 @@ async function fetchCustomValueIndex(
       i + PAGE,
     );
 
-    const { data, error } = await supabase
+    const {
+      data,
+      error,
+    } = await supabase
       .from('contact_custom_values')
       .select(
         'contact_id, custom_field_id, value',
       )
-      .in('contact_id', slice);
+      .in(
+        'contact_id',
+        slice,
+      );
 
     if (error) {
       throw new Error(
@@ -246,7 +267,9 @@ async function fetchCustomValueIndex(
 
     for (const row of data ?? []) {
       const bucket =
-        index.get(row.contact_id) ??
+        index.get(
+          row.contact_id,
+        ) ??
         new Map<string, string>();
 
       bucket.set(
@@ -265,7 +288,9 @@ async function fetchCustomValueIndex(
 }
 
 /**
- * Resolve audiência por campo personalizado.
+ * ============================================================
+ * RESOLVE AUDIÊNCIA POR CAMPO PERSONALIZADO
+ * ============================================================
  */
 async function resolveCustomFieldAudience(
   supabase: ReturnType<typeof createClient>,
@@ -320,7 +345,8 @@ async function resolveCustomFieldAudience(
   const contactIds = [
     ...new Set(
       (matches ?? []).map(
-        (match) => match.contact_id,
+        (match) =>
+          match.contact_id,
       ),
     ),
   ];
@@ -353,25 +379,6 @@ async function resolveCustomFieldAudience(
  * ============================================================
  * CSV -> CONTACTS
  * ============================================================
- *
- * IMPORTANTE:
- *
- * O CSV é a audiência.
- *
- * Não dependemos de a consulta do Supabase encontrar todos os
- * telefones antes de considerar a audiência válida.
- *
- * Para cada telefone:
- *
- * 1. normaliza;
- * 2. tenta reutilizar contato existente;
- * 3. se não existir, cria;
- * 4. se não conseguir obter o contato por RLS/consulta,
- *    mantém um contato temporário para o disparo.
- *
- * Isso evita que um CSV válido seja transformado em:
- *
- * No contacts found for this audience.
  */
 async function upsertCsvContacts(
   supabase: ReturnType<typeof createClient>,
@@ -400,19 +407,23 @@ async function upsertCsvContacts(
   >();
 
   for (const row of csvRows) {
-    const phone = normalizePhone(
-      row.phone,
-    );
+    const phone =
+      normalizePhone(
+        row.phone,
+      );
 
     if (!phone) {
       continue;
     }
 
     if (!uniqueByPhone.has(phone)) {
-      uniqueByPhone.set(phone, {
+      uniqueByPhone.set(
         phone,
-        name: row.name,
-      });
+        {
+          phone,
+          name: row.name,
+        },
+      );
     }
   }
 
@@ -428,10 +439,6 @@ async function upsertCsvContacts(
    * ----------------------------------------------------------
    * 2. BUSCAR CONTATOS EXISTENTES
    * ----------------------------------------------------------
-   *
-   * Primeiro tentamos buscar somente os telefones necessários.
-   *
-   * Depois fazemos fallback para todos os contatos da conta.
    */
   const byPhone = new Map<
     string,
@@ -444,7 +451,10 @@ async function upsertCsvContacts(
   } = await supabase
     .from('contacts')
     .select('*')
-    .eq('account_id', accountId)
+    .eq(
+      'account_id',
+      accountId,
+    )
     .in(
       'phone_normalized',
       phones,
@@ -454,7 +464,8 @@ async function upsertCsvContacts(
     !normalizedLookupError &&
     existingByNormalized
   ) {
-    for (const contact of existingByNormalized as Contact[]) {
+    for (const contact of
+      existingByNormalized as Contact[]) {
       const normalized =
         normalizePhone(
           contact.phone_normalized ||
@@ -474,16 +485,16 @@ async function upsertCsvContacts(
    * ----------------------------------------------------------
    * 3. FALLBACK
    * ----------------------------------------------------------
-   *
-   * Se phone_normalized não estiver preenchido corretamente
-   * em algum contato antigo, buscamos os contatos da conta e
-   * normalizamos o campo phone em memória.
    */
-  const missingPhones = phones.filter(
-    (phone) => !byPhone.has(phone),
-  );
+  const missingPhones =
+    phones.filter(
+      (phone) =>
+        !byPhone.has(phone),
+    );
 
-  if (missingPhones.length > 0) {
+  if (
+    missingPhones.length > 0
+  ) {
     const {
       data: existing,
       error: lookupErr,
@@ -496,9 +507,8 @@ async function upsertCsvContacts(
       );
 
     if (!lookupErr) {
-      for (const contact of (
-        existing ?? []
-      ) as Contact[]) {
+      for (const contact of
+        (existing ?? []) as Contact[]) {
         const normalized =
           normalizePhone(
             contact.phone_normalized ||
@@ -507,7 +517,9 @@ async function upsertCsvContacts(
 
         if (
           normalized &&
-          !byPhone.has(normalized)
+          !byPhone.has(
+            normalized,
+          )
         ) {
           byPhone.set(
             normalized,
@@ -525,15 +537,17 @@ async function upsertCsvContacts(
    */
   const missing = phones
     .filter(
-      (phone) => !byPhone.has(phone),
+      (phone) =>
+        !byPhone.has(phone),
     )
     .map((phone) => ({
       user_id: userId,
       account_id: accountId,
       phone,
       name:
-        uniqueByPhone.get(phone)
-          ?.name ?? null,
+        uniqueByPhone.get(
+          phone,
+        )?.name ?? null,
     }));
 
   const INSERT_CHUNK = 200;
@@ -543,10 +557,11 @@ async function upsertCsvContacts(
     i < missing.length;
     i += INSERT_CHUNK
   ) {
-    const chunk = missing.slice(
-      i,
-      i + INSERT_CHUNK,
-    );
+    const chunk =
+      missing.slice(
+        i,
+        i + INSERT_CHUNK,
+      );
 
     const {
       data: inserted,
@@ -557,9 +572,8 @@ async function upsertCsvContacts(
       .select();
 
     if (!insertErr) {
-      for (const contact of (
-        inserted ?? []
-      ) as Contact[]) {
+      for (const contact of
+        (inserted ?? []) as Contact[]) {
         const normalized =
           normalizePhone(
             contact.phone_normalized ||
@@ -579,12 +593,11 @@ async function upsertCsvContacts(
 
     /**
      * Condição de corrida:
-     *
-     * outro processo pode ter criado o contato entre a
-     * consulta e o INSERT.
+     * outro processo pode ter criado o contato.
      */
     if (
-      insertErr.code === '23505' ||
+      insertErr.code ===
+        '23505' ||
       insertErr.message.includes(
         'idx_contacts_account_phone_normalized',
       )
@@ -599,9 +612,8 @@ async function upsertCsvContacts(
           accountId,
         );
 
-      for (const contact of (
-        refreshed ?? []
-      ) as Contact[]) {
+      for (const contact of
+        (refreshed ?? []) as Contact[]) {
         const normalized =
           normalizePhone(
             contact.phone_normalized ||
@@ -619,12 +631,6 @@ async function upsertCsvContacts(
       continue;
     }
 
-    /**
-     * Não interrompemos aqui.
-     *
-     * O contato ainda pode ser usado pela campanha através
-     * do telefone do CSV.
-     */
     console.warn(
       '[broadcast] Could not create some CSV contacts:',
       insertErr.message,
@@ -633,13 +639,14 @@ async function upsertCsvContacts(
 
   /**
    * ----------------------------------------------------------
-   * 5. RETORNAR OS CONTATOS
+   * 5. RETORNAR CONTATOS
    * ----------------------------------------------------------
    */
   const result: Contact[] = [];
 
   for (const phone of phones) {
-    const existing = byPhone.get(phone);
+    const existing =
+      byPhone.get(phone);
 
     if (existing) {
       result.push(existing);
@@ -647,13 +654,8 @@ async function upsertCsvContacts(
     }
 
     /**
-     * Fallback importante:
-     *
-     * Mesmo que o Supabase não tenha retornado o contato criado,
+     * Fallback:
      * o telefone do CSV continua sendo uma audiência válida.
-     *
-     * Criamos um objeto local apenas para que o restante do
-     * fluxo consiga montar os recipients.
      */
     const csvContact =
       uniqueByPhone.get(phone);
@@ -666,7 +668,8 @@ async function upsertCsvContacts(
         phone,
         phone_normalized: phone,
         name:
-          csvContact?.name ?? null,
+          csvContact?.name ??
+          null,
       } as Contact;
 
     result.push(
@@ -679,17 +682,76 @@ async function upsertCsvContacts(
 
 /**
  * ============================================================
+ * EXTRAI A QUANTIDADE DE VARIÁVEIS DO BODY DO TEMPLATE
+ * ============================================================
+ */
+function getBodyVariableCount(
+  template: MessageTemplate,
+): number {
+  const bodyText =
+    typeof template.body_text ===
+    'string'
+      ? template.body_text
+      : '';
+
+  if (!bodyText) {
+    return 0;
+  }
+
+  const matches =
+    bodyText.match(
+      /\{\{\s*(\d+)\s*\}\}/g,
+    );
+
+  if (!matches) {
+    return 0;
+  }
+
+  const indices =
+    matches
+      .map((match) => {
+        const found =
+          match.match(
+            /\{\{\s*(\d+)\s*\}\}/,
+          );
+
+        return found
+          ? Number(found[1])
+          : 0;
+      })
+      .filter(
+        (value) =>
+          Number.isFinite(value) &&
+          value > 0,
+      );
+
+  if (indices.length === 0) {
+    return 0;
+  }
+
+  return Math.max(
+    ...indices,
+  );
+}
+
+/**
+ * ============================================================
  * HOOK
  * ============================================================
  */
 export function useBroadcastSending(): UseBroadcastSendingReturn {
-  const { accountId } = useAuth();
+  const { accountId } =
+    useAuth();
 
-  const [isProcessing, setIsProcessing] =
-    useState(false);
+  const [
+    isProcessing,
+    setIsProcessing,
+  ] = useState(false);
 
-  const [progress, setProgress] =
-    useState(0);
+  const [
+    progress,
+    setProgress,
+  ] = useState(0);
 
   /**
    * ==========================================================
@@ -699,7 +761,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
   async function resolveAudience(
     audience: AudienceConfig,
   ): Promise<Contact[]> {
-    const supabase = createClient();
+    const supabase =
+      createClient();
 
     let contacts: Contact[] = [];
 
@@ -708,7 +771,9 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
      * TODOS
      * --------------------------------------------------------
      */
-    if (audience.type === 'all') {
+    if (
+      audience.type === 'all'
+    ) {
       const {
         data,
         error,
@@ -731,7 +796,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
      * --------------------------------------------------------
      */
     else if (
-      audience.type === 'tags' &&
+      audience.type ===
+        'tags' &&
       audience.tagIds &&
       audience.tagIds.length > 0
     ) {
@@ -740,7 +806,9 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         error: tagError,
       } = await supabase
         .from('contact_tags')
-        .select('contact_id')
+        .select(
+          'contact_id',
+        )
         .in(
           'tag_id',
           audience.tagIds,
@@ -756,13 +824,15 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         contactTags &&
         contactTags.length > 0
       ) {
-        const uniqueContactIds = [
-          ...new Set(
-            contactTags.map(
-              (ct) => ct.contact_id,
+        const uniqueContactIds =
+          [
+            ...new Set(
+              contactTags.map(
+                (ct) =>
+                  ct.contact_id,
+              ),
             ),
-          ),
-        ];
+          ];
 
         const {
           data,
@@ -808,14 +878,18 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
      * --------------------------------------------------------
      */
     else if (
-      audience.type === 'csv'
+      audience.type ===
+      'csv'
     ) {
       const {
-        data: { session },
+        data: {
+          session,
+        },
       } =
         await supabase.auth.getSession();
 
-      const user = session?.user;
+      const user =
+        session?.user;
 
       if (!user) {
         throw new Error(
@@ -829,12 +903,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      /**
-       * CSV vazio = audiência vazia.
-       */
       if (
         !audience.csvContacts ||
-        audience.csvContacts.length === 0
+        audience.csvContacts
+          .length === 0
       ) {
         return [];
       }
@@ -855,14 +927,17 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
      */
     if (
       audience.excludeTagIds &&
-      audience.excludeTagIds.length > 0
+      audience.excludeTagIds
+        .length > 0
     ) {
       const {
         data: excludeRows,
         error: excludeError,
       } = await supabase
         .from('contact_tags')
-        .select('contact_id')
+        .select(
+          'contact_id',
+        )
         .in(
           'tag_id',
           audience.excludeTagIds,
@@ -876,7 +951,10 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       const excludedIds =
         new Set(
-          (excludeRows ?? []).map(
+          (
+            excludeRows ??
+            []
+          ).map(
             (row) =>
               row.contact_id,
           ),
@@ -905,7 +983,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     setIsProcessing(true);
     setProgress(0);
 
-    const supabase = createClient();
+    const supabase =
+      createClient();
 
     try {
       /**
@@ -914,11 +993,14 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
        * --------------------------------------------------------
        */
       const {
-        data: { session },
+        data: {
+          session,
+        },
       } =
         await supabase.auth.getSession();
 
-      const user = session?.user;
+      const user =
+        session?.user;
 
       if (!user) {
         throw new Error(
@@ -944,7 +1026,9 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           payload.audience,
         );
 
-      if (contacts.length === 0) {
+      if (
+        contacts.length === 0
+      ) {
         throw new Error(
           'No contacts found for this audience.',
         );
@@ -956,7 +1040,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           type:
             payload.audience.type,
           csvCount:
-            payload.audience.csvContacts
+            payload.audience
+              .csvContacts
               ?.length ?? 0,
           resolvedCount:
             contacts.length,
@@ -969,10 +1054,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
        * --------------------------------------------------------
        * 3. CUSTOM VALUES
        * --------------------------------------------------------
-       *
-       * Contatos temporários criados pelo fallback CSV não
-       * possuem custom fields. Eles simplesmente retornam
-       * valores vazios para essas variáveis.
        */
       const realContactIds =
         contacts
@@ -997,14 +1078,28 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
        * --------------------------------------------------------
        * 4. INDEX CSV
        * --------------------------------------------------------
+       *
+       * A linha original do CSV é preservada.
+       *
+       * O telefone normalizado é usado somente como chave.
+       *
+       * Isso garante:
+       *
+       * CSV:
+       * 5511999999999 | Maria
+       *
+       * ->
+       *
+       * {{1}} = Maria
        */
-      const csvByPhone = new Map<
-        string,
-        {
-          phone: string;
-          name?: string;
-        }
-      >();
+      const csvByPhone =
+        new Map<
+          string,
+          {
+            phone: string;
+            name?: string;
+          }
+        >();
 
       for (const csvContact of
         payload.audience
@@ -1032,46 +1127,167 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
        * 5. MONTAR RECIPIENTS
        * --------------------------------------------------------
        */
-      const recipients = contacts
-        .map((contact) => {
-          const phone =
-            normalizePhone(
-              contact.phone,
+      let recipients:
+        {
+          to: string;
+          params: string[];
+        }[] = [];
+
+      /**
+       * ========================================================
+       * CSV
+       * ========================================================
+       *
+       * Para CSV, usamos a própria lista CSV como origem dos
+       * recipients.
+       *
+       * Isso evita depender de qualquer diferença entre:
+       *
+       * CSV name
+       *
+       * e
+       *
+       * contacts.name
+       *
+       * no Supabase.
+       */
+      if (
+        payload.audience.type ===
+          'csv' &&
+        payload.audience
+          .csvContacts &&
+        payload.audience
+          .csvContacts.length > 0
+      ) {
+        recipients =
+          payload.audience
+            .csvContacts
+            .map(
+              (
+                csvRow,
+              ) => {
+                const phone =
+                  normalizePhone(
+                    csvRow.phone,
+                  );
+
+                if (!phone) {
+                  return null;
+                }
+
+                /**
+                 * Encontra o contato correspondente apenas
+                 * para campos que não são CSV.
+                 */
+                const contact =
+                  contacts.find(
+                    (
+                      item,
+                    ) =>
+                      normalizePhone(
+                        item.phone,
+                      ) ===
+                      phone,
+                  ) ??
+                  ({
+                    id: `csv-${phone}`,
+                    user_id:
+                      user.id,
+                    account_id:
+                      accountId,
+                    phone,
+                    phone_normalized:
+                      phone,
+                    name:
+                      csvRow.name ??
+                      null,
+                  } as Contact);
+
+                const csvContact =
+                  csvByPhone.get(
+                    phone,
+                  ) ?? {
+                    phone,
+                    name:
+                      csvRow.name,
+                  };
+
+                const params =
+                  resolveVariables(
+                    payload.variables,
+                    contact,
+                    customValueIndex.get(
+                      contact.id,
+                    ),
+                    csvContact,
+                  );
+
+                return {
+                  to: phone,
+                  params,
+                };
+              },
+            )
+            .filter(
+              (
+                recipient,
+              ): recipient is {
+                to: string;
+                params: string[];
+              } =>
+                Boolean(
+                  recipient,
+                ),
             );
+      } else {
+        /**
+         * ======================================================
+         * CONTATOS NORMAIS
+         * ======================================================
+         */
+        recipients =
+          contacts
+            .map(
+              (
+                contact,
+              ) => {
+                const phone =
+                  normalizePhone(
+                    contact.phone,
+                  );
 
-          if (!phone) {
-            return null;
-          }
+                if (!phone) {
+                  return null;
+                }
 
-          const csvContact =
-            csvByPhone.get(phone);
+                const params =
+                  resolveVariables(
+                    payload.variables,
+                    contact,
+                    customValueIndex.get(
+                      contact.id,
+                    ),
+                    undefined,
+                  );
 
-          const params =
-            resolveVariables(
-              payload.variables,
-              contact,
-              customValueIndex.get(
-                contact.id,
-              ),
-              csvContact,
+                return {
+                  to: phone,
+                  params,
+                };
+              },
+            )
+            .filter(
+              (
+                recipient,
+              ): recipient is {
+                to: string;
+                params: string[];
+              } =>
+                Boolean(
+                  recipient,
+                ),
             );
-
-          return {
-            to: phone,
-            params,
-          };
-        })
-        .filter(
-          (
-            recipient,
-          ): recipient is {
-            to: string;
-            params: string[];
-          } =>
-            Boolean(
-              recipient,
-            ),
-        );
+      }
 
       /**
        * --------------------------------------------------------
@@ -1086,16 +1302,98 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
+      /**
+       * --------------------------------------------------------
+       * 7. VALIDAR VARIÁVEIS DO TEMPLATE
+       * --------------------------------------------------------
+       *
+       * Exemplo:
+       *
+       * Template:
+       *
+       * Olá {{1}}
+       *
+       * exige pelo menos:
+       *
+       * params: ['Maria']
+       *
+       * Nunca permitimos:
+       *
+       * params: []
+       *
+       * porque isso causaria:
+       *
+       * Body has 1 variable(s) but only 0 value(s)
+       */
+      const bodyVariableCount =
+        getBodyVariableCount(
+          payload.template,
+        );
+
+      if (
+        bodyVariableCount > 0
+      ) {
+        const invalidRecipients =
+          recipients.filter(
+            (recipient) =>
+              recipient.params
+                .length <
+              bodyVariableCount,
+          );
+
+        if (
+          invalidRecipients.length >
+          0
+        ) {
+          console.error(
+            '[broadcast] Recipients with missing template parameters:',
+            invalidRecipients.map(
+              (recipient) => ({
+                to:
+                  recipient.to,
+                params:
+                  recipient.params,
+              }),
+            ),
+          );
+
+          throw new Error(
+            `The template requires ${bodyVariableCount} body variable(s), but ${invalidRecipients.length} recipient(s) do not have enough values. Check the CSV variable mapping.`,
+          );
+        }
+      }
+
+      /**
+       * --------------------------------------------------------
+       * LOG DETALHADO
+       * --------------------------------------------------------
+       *
+       * Mantido para facilitar diagnóstico de campanhas.
+       *
+       * NÃO imprime o conteúdo completo de todos os recipients
+       * quando a campanha é grande.
+       */
       console.log(
         '[broadcast] Recipients prepared:',
         {
           count:
             recipients.length,
-          recipients:
-            recipients.map(
-              (recipient) =>
-                recipient.to,
-            ),
+          bodyVariableCount,
+          variableMappings:
+            payload.variables,
+          sample:
+            recipients
+              .slice(0, 10)
+              .map(
+                (
+                  recipient,
+                ) => ({
+                  to:
+                    recipient.to,
+                  params:
+                    recipient.params,
+                }),
+              ),
         },
       );
 
@@ -1103,7 +1401,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       /**
        * --------------------------------------------------------
-       * 7. CRIAR CAMPANHA NO SERVIDOR
+       * 8. CRIAR CAMPANHA NO SERVIDOR
        * --------------------------------------------------------
        *
        * O navegador NÃO envia WhatsApp.
@@ -1183,7 +1481,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       /**
        * --------------------------------------------------------
-       * 8. ERRO DO SERVIDOR
+       * 9. ERRO DO SERVIDOR
        * --------------------------------------------------------
        */
       if (!response.ok) {
@@ -1196,7 +1494,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       /**
        * --------------------------------------------------------
-       * 9. ID DA CAMPANHA
+       * 10. ID DA CAMPANHA
        * --------------------------------------------------------
        */
       const broadcastId =

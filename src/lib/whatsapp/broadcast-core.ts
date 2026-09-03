@@ -145,7 +145,7 @@ export const MAX_RECIPIENTS =
  * Depois um novo pass é criado automaticamente.
  */
 export const DELIVERY_BATCH_SIZE =
-  50;
+  1000;
 
 // ============================================================
 // Create broadcast

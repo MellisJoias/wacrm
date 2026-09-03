@@ -59,17 +59,14 @@ export const RESUME_SCOPES: readonly ResumeScope[] =
 //
 // 322 recipients
 //
-// pass 1 -> 50
-// pass 2 -> 50
-// pass 3 -> 50
-// ...
+// pass 1 -> 322
 //
-// Dentro de cada pass:
+// Dentro do pass:
 // 1 por vez.
 // ============================================================
 
 export const RESUME_MAX_PER_REQUEST =
-  50;
+  1000;
 
 // ============================================================
 // Lock
@@ -216,9 +213,11 @@ interface RecipientRow {
   contact:
     | {
         phone?: string | null;
+        name?: string | null;
       }
     | {
         phone?: string | null;
+        name?: string | null;
       }[]
     | null;
 }
@@ -241,6 +240,80 @@ function contactPhone(
     contact?.phone ??
     null
   );
+}
+
+// ============================================================
+// Contact name
+// ============================================================
+
+function contactName(
+  row: RecipientRow,
+): string | null {
+  const contact =
+    Array.isArray(
+      row.contact,
+    )
+      ? row.contact[0]
+      : row.contact;
+
+  return (
+    contact?.name?.trim() ??
+    null
+  );
+}
+
+// ============================================================
+// Template params
+// ============================================================
+//
+// Se os parâmetros foram salvos na campanha, usamos eles.
+//
+// Se não foram salvos, usamos o nome do contato como fallback
+// para o primeiro parâmetro {{1}}.
+//
+// Isso permite que o Resume continue uma campanha mesmo quando
+// template_params estiver vazio.
+// ============================================================
+
+function resolveRecipientParams(
+  row: RecipientRow,
+): string[] {
+  if (
+    Array.isArray(
+      row.template_params,
+    )
+  ) {
+    const params =
+      row.template_params.filter(
+        (
+          p,
+        ): p is string =>
+          typeof p ===
+          'string' &&
+          p.trim() !== '',
+      );
+
+    if (
+      params.length > 0
+    ) {
+      return params;
+    }
+  }
+
+  const name =
+    contactName(
+      row,
+    );
+
+  if (
+    name
+  ) {
+    return [
+      name,
+    ];
+  }
+
+  return [];
 }
 
 // ============================================================
@@ -306,7 +379,7 @@ export async function planBroadcastResume(
       'broadcast_recipients',
     )
     .select(
-      'id, contact_id, template_params, contact:contacts(phone)',
+      'id, contact_id, template_params, contact:contacts(phone, name)',
     )
     .eq(
       'broadcast_id',
@@ -555,17 +628,9 @@ export async function planBroadcastResume(
               ),
 
             params:
-              Array.isArray(
-                row.template_params,
-              )
-                ? row.template_params.filter(
-                    (
-                      p,
-                    ): p is string =>
-                      typeof p ===
-                      'string',
-                  )
-                : [],
+              resolveRecipientParams(
+                row,
+              ),
           }),
         ),
 

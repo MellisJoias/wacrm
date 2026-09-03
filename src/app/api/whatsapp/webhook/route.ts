@@ -186,6 +186,18 @@ interface WhatsAppWebhookEntry {
         status: string
         timestamp: string
         recipient_id: string
+
+        // ======================================================
+        // Meta sends this array when a message fails.
+        // ======================================================
+        errors?: Array<{
+          code?: number
+          title?: string
+          message?: string
+          error_data?: {
+            details?: string
+          }
+        }>
       }>
     }
 
@@ -523,6 +535,18 @@ async function handleStatusUpdate(status: {
   status: string
   timestamp: string
   recipient_id: string
+
+  // ============================================================
+  // Meta sends this array when a message fails.
+  // ============================================================
+  errors?: Array<{
+    code?: number
+    title?: string
+    message?: string
+    error_data?: {
+      details?: string
+    }
+  }>
 }) {
   const { error: msgErr } =
     await supabaseAdmin()
@@ -591,6 +615,47 @@ async function handleStatusUpdate(status: {
       status.status === 'read'
     ) {
       update.read_at = tsIso
+    }
+
+    // ==========================================================
+    // IMPORTANT:
+    // When Meta reports "failed", save the actual error returned
+    // by Meta instead of leaving error_message as NULL.
+    // ==========================================================
+
+    if (
+      status.status === 'failed'
+    ) {
+      const metaError =
+        status.errors?.[0]
+
+      update.error_message =
+        metaError
+          ? [
+              metaError.code !== undefined
+                ? `Código ${metaError.code}`
+                : null,
+              metaError.title,
+              metaError.message,
+              metaError.error_data?.details,
+            ]
+              .filter(Boolean)
+              .join(' — ')
+          : 'Meta marcou a mensagem como failed, mas não informou o motivo.'
+
+      console.error(
+        '[whatsapp-webhook] Meta delivery failed:',
+        {
+          whatsapp_message_id:
+            status.id,
+
+          recipient_id:
+            status.recipient_id,
+
+          error:
+            metaError,
+        }
+      )
     }
 
     const {

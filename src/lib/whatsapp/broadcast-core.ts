@@ -9,6 +9,8 @@
 //      |
 //      +--> persist result
 //      |
+//      +--> random delay
+//      |
 //      v
 //   Recipient 2
 //      |
@@ -16,12 +18,19 @@
 //      |
 //      +--> persist result
 //      |
+//      +--> random delay
+//      |
 //      v
 //   ...
 //
 // CONCURRENCY = 1
 //
 // Nunca existe Promise.all() para recipients.
+//
+// IMPORTANTE:
+//
+// O delay acontece SOMENTE entre destinatários.
+// As variantes do mesmo telefone são tentadas sem delay.
 // ============================================================
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -129,23 +138,80 @@ export const MAX_RECIPIENTS =
 /**
  * Quantos recipients uma execução da Vercel processa.
  *
- * IMPORTANTE:
- *
- * Isto NÃO significa concorrência 50.
- *
- * Continua:
+ * Continua sendo sequencial:
  *
  *   1 -> await
  *   2 -> await
  *   3 -> await
  *   ...
- *
- * até 50.
- *
- * Depois um novo pass é criado automaticamente.
  */
 export const DELIVERY_BATCH_SIZE =
   1000;
+
+// ============================================================
+// Broadcast delay
+// ============================================================
+//
+// Intervalo aplicado SOMENTE depois que um destinatário
+// terminou completamente.
+//
+// As variantes do mesmo telefone NÃO passam por este delay.
+//
+// Exemplo:
+//
+//   telefone A
+//      -> variante 1
+//      -> variante 2
+//      -> variante 3
+//      -> resultado final
+//      -> DELAY 10-20s
+//      -> telefone B
+//
+// ============================================================
+
+export const BROADCAST_MIN_DELAY_MS =
+  10_000;
+
+export const BROADCAST_MAX_DELAY_MS =
+  20_000;
+
+/**
+ * Aguarda um intervalo aleatório entre
+ * BROADCAST_MIN_DELAY_MS e BROADCAST_MAX_DELAY_MS.
+ */
+async function waitBetweenBroadcastRecipients(): Promise<void> {
+  const min =
+    BROADCAST_MIN_DELAY_MS;
+
+  const max =
+    BROADCAST_MAX_DELAY_MS;
+
+  const delayMs =
+    Math.floor(
+      Math.random() *
+        (max - min + 1),
+    ) + min;
+
+  console.log(
+    '[broadcast-core] WAITING BETWEEN RECIPIENTS',
+    {
+      delayMs,
+      delaySeconds:
+        Math.round(
+          delayMs / 1000,
+        ),
+    },
+  );
+
+  await new Promise<void>(
+    (resolve) => {
+      setTimeout(
+        resolve,
+        delayMs,
+      );
+    },
+  );
+}
 
 // ============================================================
 // Create broadcast
@@ -1140,6 +1206,9 @@ function isNumberWithoutWhatsAppError(
 //
 // Cada recipient termina completamente antes do próximo.
 //
+// O delay é aplicado SOMENTE depois que o recipient
+// terminou, inclusive em caso de falha.
+//
 // ============================================================
 
 export async function deliverBroadcast(
@@ -1165,6 +1234,9 @@ export async function deliverBroadcast(
 
       concurrency:
         1,
+
+      delayRange:
+        '10-20 seconds between recipients',
     },
   );
 
@@ -1221,11 +1293,20 @@ export async function deliverBroadcast(
 
         phone:
           recipient.phone,
+
+        variants,
       },
     );
 
     // --------------------------------------------------------
     // Phone variants também são sequenciais.
+    //
+    // IMPORTANTE:
+    //
+    // NÃO existe delay aqui.
+    //
+    // Se a primeira variante falhar com erro que permita
+    // tentar outra variante, a próxima é chamada imediatamente.
     // --------------------------------------------------------
 
     for (
@@ -1361,8 +1442,20 @@ export async function deliverBroadcast(
 
             recipientRowId:
               recipient.recipientRowId,
+
+            phone:
+              recipient.phone,
+
+            failedVariant:
+              variant,
           },
         );
+
+        // ------------------------------------------------------
+        // NÃO adicionar delay aqui.
+        //
+        // A próxima variante será tentada imediatamente.
+        // ------------------------------------------------------
       }
     }
 
@@ -1453,84 +1546,107 @@ export async function deliverBroadcast(
             startedAt,
         },
       );
+    } else {
+      // --------------------------------------------------------
+      // FAILURE
+      // --------------------------------------------------------
 
-      continue;
+      failed++;
+
+      const failureMessage =
+        numberWithoutWhatsApp
+          ? 'Número não possui WhatsApp'
+          : (
+              lastError ||
+              'Unknown error'
+            );
+
+      const {
+        error:
+          recipientUpdateError,
+      } = await db
+        .from(
+          'broadcast_recipients',
+        )
+        .update({
+          status:
+            'failed',
+
+          error_message:
+            failureMessage,
+        })
+        .eq(
+          'id',
+          recipient.recipientRowId,
+        );
+
+      if (
+        recipientUpdateError
+      ) {
+        console.error(
+          '[broadcast-core] failed marking recipient failed:',
+          recipientUpdateError,
+        );
+      }
+
+      console.warn(
+        '[broadcast-core] RECIPIENT FAILED',
+        {
+          broadcastId:
+            plan.broadcastId,
+
+          position:
+            `${position}/${total}`,
+
+          phone:
+            recipient.phone,
+
+          reason:
+            failureMessage,
+
+          sent,
+
+          failed,
+
+          remaining:
+            total -
+            processed,
+
+          elapsedMs:
+            Date.now() -
+            startedAt,
+        },
+      );
+
+      // Não lança erro.
+      //
+      // O próximo recipient continua depois do delay.
     }
 
     // ----------------------------------------------------------
-    // FAILURE
+    // DELAY ENTRE DESTINATÁRIOS
     // ----------------------------------------------------------
-
-    failed++;
-
-    const failureMessage =
-      numberWithoutWhatsApp
-        ? 'Número não possui WhatsApp'
-        : (
-            lastError ||
-            'Unknown error'
-          );
-
-    const {
-      error:
-        recipientUpdateError,
-    } = await db
-      .from(
-        'broadcast_recipients',
-      )
-      .update({
-        status:
-          'failed',
-
-        error_message:
-          failureMessage,
-      })
-      .eq(
-        'id',
-        recipient.recipientRowId,
-      );
+    //
+    // Este é o único lugar onde existe espera entre
+    // destinatários.
+    //
+    // IMPORTANTE:
+    //
+    // - sucesso -> delay
+    // - falha -> delay
+    // - variante 1 -> variante 2 = SEM delay
+    // - variante 2 -> variante 3 = SEM delay
+    //
+    // Não há necessidade de esperar depois do último
+    // destinatário do pass.
+    // ----------------------------------------------------------
 
     if (
-      recipientUpdateError
+      processed <
+      total
     ) {
-      console.error(
-        '[broadcast-core] failed marking recipient failed:',
-        recipientUpdateError,
-      );
+      await waitBetweenBroadcastRecipients();
     }
-
-    console.warn(
-      '[broadcast-core] RECIPIENT FAILED',
-      {
-        broadcastId:
-          plan.broadcastId,
-
-        position:
-          `${position}/${total}`,
-
-        phone:
-          recipient.phone,
-
-        reason:
-          failureMessage,
-
-        sent,
-
-        failed,
-
-        remaining:
-          total -
-          processed,
-
-        elapsedMs:
-          Date.now() -
-          startedAt,
-      },
-    );
-
-    // Não lança erro.
-    //
-    // O próximo recipient continua.
   }
 
   // ----------------------------------------------------------

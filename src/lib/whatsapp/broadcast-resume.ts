@@ -40,33 +40,36 @@ export type ResumeScope =
   | 'failed'
   | 'all';
 
-export const RESUME_SCOPES: readonly ResumeScope[] =
-  [
-    'pending',
-    'failed',
-    'all',
-  ];
+export const RESUME_SCOPES: readonly ResumeScope[] = [
+  'pending',
+  'failed',
+  'all',
+];
 
 // ============================================================
 // Limits
 // ============================================================
 //
-// Este limite é por PASS.
+// Cada execução processa no máximo 12 destinatários.
 //
-// Não é concorrência.
+// Isso é necessário porque o delivery é sequencial e existe
+// um intervalo aleatório de 10–20 segundos entre destinatários.
 //
 // Exemplo:
 //
-// 322 recipients
+// 55 pending:
 //
-// pass 1 -> 322
+// PASS 1 -> 12
+// PASS 2 -> 12
+// PASS 3 -> 12
+// PASS 4 -> 12
+// PASS 5 -> 7
 //
-// Dentro do pass:
-// 1 por vez.
+// Variantes do mesmo telefone NÃO consomem esse intervalo.
+//
 // ============================================================
 
-export const RESUME_MAX_PER_REQUEST =
-  1000;
+export const RESUME_MAX_PER_REQUEST = 12;
 
 // ============================================================
 // Lock
@@ -82,20 +85,12 @@ export const DELIVERY_LOCK_STALE_MS =
 function scopeStatuses(
   scope: ResumeScope,
 ): string[] {
-  if (
-    scope === 'pending'
-  ) {
-    return [
-      'pending',
-    ];
+  if (scope === 'pending') {
+    return ['pending'];
   }
 
-  if (
-    scope === 'failed'
-  ) {
-    return [
-      'failed',
-    ];
+  if (scope === 'failed') {
+    return ['failed'];
   }
 
   return [
@@ -112,8 +107,7 @@ export async function claimBroadcastDelivery(
   db: SupabaseClient,
   accountId: string,
   broadcastId: string,
-  now: Date =
-    new Date(),
+  now: Date = new Date(),
 ): Promise<boolean> {
   const staleCutoff =
     new Date(
@@ -193,9 +187,7 @@ export async function releaseBroadcastDelivery(
 
 export interface ResumePlan {
   plan: BroadcastPlan;
-
   remaining: number;
-
   unsendable: number;
 }
 
@@ -230,9 +222,7 @@ function contactPhone(
   row: RecipientRow,
 ): string | null {
   const contact =
-    Array.isArray(
-      row.contact,
-    )
+    Array.isArray(row.contact)
       ? row.contact[0]
       : row.contact;
 
@@ -250,9 +240,7 @@ function contactName(
   row: RecipientRow,
 ): string | null {
   const contact =
-    Array.isArray(
-      row.contact,
-    )
+    Array.isArray(row.contact)
       ? row.contact[0]
       : row.contact;
 
@@ -264,15 +252,6 @@ function contactName(
 
 // ============================================================
 // Template params
-// ============================================================
-//
-// Se os parâmetros foram salvos na campanha, usamos eles.
-//
-// Se não foram salvos, usamos o nome do contato como fallback
-// para o primeiro parâmetro {{1}}.
-//
-// Isso permite que o Resume continue uma campanha mesmo quando
-// template_params estiver vazio.
 // ============================================================
 
 function resolveRecipientParams(
@@ -288,8 +267,7 @@ function resolveRecipientParams(
         (
           p,
         ): p is string =>
-          typeof p ===
-          'string' &&
+          typeof p === 'string' &&
           p.trim() !== '',
       );
 
@@ -301,16 +279,10 @@ function resolveRecipientParams(
   }
 
   const name =
-    contactName(
-      row,
-    );
+    contactName(row);
 
-  if (
-    name
-  ) {
-    return [
-      name,
-    ];
+  if (name) {
+    return [name];
   }
 
   return [];
@@ -333,8 +305,7 @@ export async function planBroadcastResume(
 
   const {
     data: broadcast,
-    error:
-      broadcastError,
+    error: broadcastError,
   } = await db
     .from('broadcasts')
     .select(
@@ -366,18 +337,13 @@ export async function planBroadcastResume(
   // ----------------------------------------------------------
 
   const statuses =
-    scopeStatuses(
-      scope,
-    );
+    scopeStatuses(scope);
 
   const {
     data: rawRows,
-    error:
-      recipientError,
+    error: recipientError,
   } = await db
-    .from(
-      'broadcast_recipients',
-    )
+    .from('broadcast_recipients')
     .select(
       'id, contact_id, template_params, contact:contacts(phone, name)',
     )
@@ -392,14 +358,11 @@ export async function planBroadcastResume(
     .order(
       'created_at',
       {
-        ascending:
-          true,
+        ascending: true,
       },
     );
 
-  if (
-    recipientError
-  ) {
+  if (recipientError) {
     console.error(
       '[broadcast-resume] recipient load failed:',
       recipientError.message,
@@ -419,36 +382,23 @@ export async function planBroadcastResume(
   // Sendable / unsendable
   // ----------------------------------------------------------
 
-  const sendable:
-    RecipientRow[] =
-    [];
-
-  const unsendableIds:
-    string[] =
-    [];
+  const sendable: RecipientRow[] = [];
+  const unsendableIds: string[] = [];
 
   for (
     const row of rows
   ) {
     const phone =
       sanitizePhoneForMeta(
-        contactPhone(
-          row,
-        ) ?? '',
+        contactPhone(row) ?? '',
       );
 
     if (
-      isValidE164(
-        phone,
-      )
+      isValidE164(phone)
     ) {
-      sendable.push(
-        row,
-      );
+      sendable.push(row);
     } else {
-      unsendableIds.push(
-        row.id,
-      );
+      unsendableIds.push(row.id);
     }
   }
 
@@ -457,20 +407,14 @@ export async function planBroadcastResume(
   // ----------------------------------------------------------
 
   if (
-    unsendableIds.length >
-    0
+    unsendableIds.length > 0
   ) {
     const {
-      error:
-        unsendableError,
+      error: unsendableError,
     } = await db
-      .from(
-        'broadcast_recipients',
-      )
+      .from('broadcast_recipients')
       .update({
-        status:
-          'failed',
-
+        status: 'failed',
         error_message:
           'No valid phone number on contact',
       })
@@ -479,9 +423,7 @@ export async function planBroadcastResume(
         unsendableIds,
       );
 
-    if (
-      unsendableError
-    ) {
+    if (unsendableError) {
       console.error(
         '[broadcast-resume] failed marking unsendable recipients:',
         unsendableError.message,
@@ -491,6 +433,15 @@ export async function planBroadcastResume(
 
   // ----------------------------------------------------------
   // PASS LIMIT
+  // ----------------------------------------------------------
+  //
+  // IMPORTANTE:
+  //
+  // Cada execução pega no máximo 12 destinatários.
+  //
+  // Isso permite que a execução termine antes do limite
+  // de 300 segundos da Vercel.
+  //
   // ----------------------------------------------------------
 
   const slice =
@@ -515,8 +466,7 @@ export async function planBroadcastResume(
   ) {
     throw new BroadcastError(
       'nothing_to_resume',
-      scope ===
-        'failed'
+      scope === 'failed'
         ? 'This broadcast has no failed recipients to retry'
         : 'This broadcast has no recipients left to send',
       400,
@@ -529,12 +479,9 @@ export async function planBroadcastResume(
 
   const {
     data: config,
-    error:
-      configError,
+    error: configError,
   } = await db
-    .from(
-      'whatsapp_config',
-    )
+    .from('whatsapp_config')
     .select('*')
     .eq(
       'account_id',
@@ -579,64 +526,59 @@ export async function planBroadcastResume(
   // BroadcastPlan
   // ----------------------------------------------------------
 
-  const plan:
-    BroadcastPlan =
-    {
-      broadcastId,
+  const plan: BroadcastPlan = {
+    broadcastId,
 
-      accountId,
+    accountId,
 
-      auditUserId,
+    auditUserId,
 
-      templateName:
-        broadcast.template_name,
+    templateName:
+      broadcast.template_name,
 
-      templateLanguage:
-        resolvedTemplate.language,
+    templateLanguage:
+      resolvedTemplate.language,
 
-      phoneNumberId:
-        config.phone_number_id,
+    phoneNumberId:
+      config.phone_number_id,
 
-      accessToken:
-        decrypt(
-          config.access_token,
-        ),
+    accessToken:
+      decrypt(
+        config.access_token,
+      ),
 
-      templateRow:
-        resolvedTemplate.row,
+    templateRow:
+      resolvedTemplate.row,
 
-      headerMediaUrl:
-        broadcast.header_media_url ??
-        null,
+    headerMediaUrl:
+      broadcast.header_media_url ??
+      null,
 
-      planned:
-        slice.map(
-          (
-            row,
-          ) => ({
-            recipientRowId:
-              row.id,
+    planned:
+      slice.map(
+        (
+          row,
+        ) => ({
+          recipientRowId:
+            row.id,
 
-            contactId:
-              row.contact_id,
+          contactId:
+            row.contact_id,
 
-            phone:
-              sanitizePhoneForMeta(
-                contactPhone(
-                  row,
-                ) ?? '',
-              ),
+          phone:
+            sanitizePhoneForMeta(
+              contactPhone(row) ?? '',
+            ),
 
-            params:
-              resolveRecipientParams(
-                row,
-              ),
-          }),
-        ),
+          params:
+            resolveRecipientParams(
+              row,
+            ),
+        }),
+      ),
 
-      rejected:
-        0,
-    };
+    rejected: 0,
+  };
 
   return {
     plan,
@@ -661,8 +603,7 @@ export async function markBroadcastSending(
   } = await db
     .from('broadcasts')
     .update({
-      status:
-        'sending',
+      status: 'sending',
 
       updated_at:
         new Date().toISOString(),

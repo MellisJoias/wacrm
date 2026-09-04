@@ -13,15 +13,6 @@
 //      |
 //      v
 //   Recipient 2
-//      |
-//      +--> await Meta
-//      |
-//      +--> persist result
-//      |
-//      +--> random delay
-//      |
-//      v
-//   ...
 //
 // CONCURRENCY = 1
 //
@@ -70,9 +61,15 @@ export class BroadcastError extends Error {
     status: number,
   ) {
     super(message);
-    this.name = 'BroadcastError';
-    this.code = code;
-    this.status = status;
+
+    this.name =
+      'BroadcastError';
+
+    this.code =
+      code;
+
+    this.status =
+      status;
   }
 }
 
@@ -92,15 +89,19 @@ export interface CreateBroadcastParams {
 
   templateLanguage?: string | null;
 
-  recipients: BroadcastRecipientInput[];
+  recipients:
+    BroadcastRecipientInput[];
 
   headerMediaUrl?: string | null;
 }
 
 export interface PlannedRecipient {
   recipientRowId: string;
+
   contactId: string;
+
   phone: string;
+
   params: string[];
 }
 
@@ -119,11 +120,14 @@ export interface BroadcastPlan {
 
   accessToken: string;
 
-  templateRow: MessageTemplate | null;
+  templateRow:
+    MessageTemplate | null;
 
-  headerMediaUrl?: string | null;
+  headerMediaUrl?:
+    string | null;
 
-  planned: PlannedRecipient[];
+  planned:
+    PlannedRecipient[];
 
   rejected: number;
 }
@@ -136,17 +140,14 @@ export const MAX_RECIPIENTS =
   1000;
 
 /**
- * Quantos recipients uma execução da Vercel processa.
+ * Quantos recipients uma execução processa.
  *
- * Continua sendo sequencial:
+ * Continua sendo sequencial.
  *
- *   1 -> await
- *   2 -> await
- *   3 -> await
- *   ...
+ * Máximo de 12 recipients por pass.
  */
 export const DELIVERY_BATCH_SIZE =
-  1000;
+  12;
 
 // ============================================================
 // Broadcast delay
@@ -177,7 +178,7 @@ export const BROADCAST_MAX_DELAY_MS =
 
 /**
  * Aguarda um intervalo aleatório entre
- * BROADCAST_MIN_DELAY_MS e BROADCAST_MAX_DELAY_MS.
+ * 10 e 20 segundos.
  */
 async function waitBetweenBroadcastRecipients(): Promise<void> {
   const min =
@@ -196,6 +197,7 @@ async function waitBetweenBroadcastRecipients(): Promise<void> {
     '[broadcast-core] WAITING BETWEEN RECIPIENTS',
     {
       delayMs,
+
       delaySeconds:
         Math.round(
           delayMs / 1000,
@@ -230,10 +232,6 @@ export async function createBroadcast(
     headerMediaUrl,
   } = params;
 
-  // ----------------------------------------------------------
-  // Validation
-  // ----------------------------------------------------------
-
   if (!templateName) {
     throw new BroadcastError(
       'bad_request',
@@ -264,10 +262,6 @@ export async function createBroadcast(
     );
   }
 
-  // ----------------------------------------------------------
-  // WhatsApp config
-  // ----------------------------------------------------------
-
   const {
     data: config,
     error: configError,
@@ -296,10 +290,6 @@ export async function createBroadcast(
       config.access_token,
     );
 
-  // ----------------------------------------------------------
-  // Template
-  // ----------------------------------------------------------
-
   const resolvedTemplate =
     await resolveTemplateRow(
       db,
@@ -321,10 +311,6 @@ export async function createBroadcast(
   const templateRow =
     resolvedTemplate.row;
 
-  // ----------------------------------------------------------
-  // Header media
-  // ----------------------------------------------------------
-
   const normalizedHeaderMediaUrl =
     typeof headerMediaUrl === 'string'
       ? headerMediaUrl.trim()
@@ -334,10 +320,6 @@ export async function createBroadcast(
     normalizedHeaderMediaUrl ||
     templateRow?.header_media_url ||
     null;
-
-  // ----------------------------------------------------------
-  // Resolve contacts
-  // ----------------------------------------------------------
 
   const resolved: {
     contactId: string;
@@ -400,10 +382,6 @@ export async function createBroadcast(
     });
   }
 
-  // ----------------------------------------------------------
-  // Deduplicate contacts
-  // ----------------------------------------------------------
-
   const seenContact =
     new Set<string>();
 
@@ -437,10 +415,6 @@ export async function createBroadcast(
       400,
     );
   }
-
-  // ----------------------------------------------------------
-  // Atomic persistence
-  // ----------------------------------------------------------
 
   const adminDb =
     createAdminClient();
@@ -513,10 +487,6 @@ export async function createBroadcast(
     createdRows[0]
       .broadcast_id as string;
 
-  // ----------------------------------------------------------
-  // Map recipients
-  // ----------------------------------------------------------
-
   const byContact =
     new Map(
       deduped.map(
@@ -529,7 +499,8 @@ export async function createBroadcast(
       ),
     );
 
-  const planned: PlannedRecipient[] =
+  const planned:
+    PlannedRecipient[] =
     createdRows.map(
       (
         row: {
@@ -542,9 +513,7 @@ export async function createBroadcast(
             row.contact_id,
           );
 
-        if (
-          !recipient
-        ) {
+        if (!recipient) {
           throw new BroadcastError(
             'internal',
             'Broadcast recipient could not be mapped to its contact',
@@ -663,9 +632,7 @@ async function resolveBroadcastTemplateForPersistence(
       data,
       error,
     } = await db
-      .from(
-        'message_templates',
-      )
+      .from('message_templates')
       .select('*')
       .eq(
         'account_id',
@@ -783,9 +750,7 @@ async function resolveCanonicalConversation(
     data: existing,
     error: lookupError,
   } = await db
-    .from(
-      'conversations',
-    )
+    .from('conversations')
     .select('id')
     .eq(
       'account_id',
@@ -798,8 +763,7 @@ async function resolveCanonicalConversation(
     .order(
       'created_at',
       {
-        ascending:
-          true,
+        ascending: true,
       },
     )
     .limit(1);
@@ -829,9 +793,7 @@ async function resolveCanonicalConversation(
     data: created,
     error: createError,
   } = await db
-    .from(
-      'conversations',
-    )
+    .from('conversations')
     .insert({
       account_id:
         plan.accountId,
@@ -870,9 +832,7 @@ async function resolveCanonicalConversation(
       data: raced,
       error: racedError,
     } = await db
-      .from(
-        'conversations',
-      )
+      .from('conversations')
       .select('id')
       .eq(
         'account_id',
@@ -885,8 +845,7 @@ async function resolveCanonicalConversation(
       .order(
         'created_at',
         {
-          ascending:
-            true,
+          ascending: true,
         },
       )
       .limit(1);
@@ -987,9 +946,7 @@ async function persistBroadcastMessage(
     error:
       recipientTextError,
   } = await db
-    .from(
-      'broadcast_recipients',
-    )
+    .from('broadcast_recipients')
     .update({
       message_text:
         finalText ||
@@ -1000,9 +957,7 @@ async function persistBroadcastMessage(
       recipient.recipientRowId,
     );
 
-  if (
-    recipientTextError
-  ) {
+  if (recipientTextError) {
     console.error(
       '[broadcast-core] FAILED broadcast_recipients.message_text update:',
       recipientTextError,
@@ -1024,9 +979,7 @@ async function persistBroadcastMessage(
     )
     .maybeSingle();
 
-  if (
-    existingMessageError
-  ) {
+  if (existingMessageError) {
     console.error(
       '[broadcast-core] existing message lookup failed:',
       existingMessageError,
@@ -1041,9 +994,7 @@ async function persistBroadcastMessage(
     existingMessage.id
   ) {
     await db
-      .from(
-        'conversations',
-      )
+      .from('conversations')
       .update({
         last_message_text:
           finalText ||
@@ -1102,9 +1053,7 @@ async function persistBroadcastMessage(
     .insert(
       messagePayload,
     )
-    .select(
-      'id',
-    )
+    .select('id')
     .single();
 
   if (
@@ -1125,9 +1074,7 @@ async function persistBroadcastMessage(
   }
 
   await db
-    .from(
-      'conversations',
-    )
+    .from('conversations')
     .update({
       last_message_text:
         finalText ||
@@ -1199,17 +1146,6 @@ function isNumberWithoutWhatsAppError(
 // ============================================================
 // DELIVERY
 // ============================================================
-//
-// ESTE É O PONTO CENTRAL.
-//
-// Não existe Promise.all().
-//
-// Cada recipient termina completamente antes do próximo.
-//
-// O delay é aplicado SOMENTE depois que o recipient
-// terminou, inclusive em caso de falha.
-//
-// ============================================================
 
 export async function deliverBroadcast(
   db: SupabaseClient,
@@ -1232,8 +1168,7 @@ export async function deliverBroadcast(
 
       total,
 
-      concurrency:
-        1,
+      concurrency: 1,
 
       delayRange:
         '10-20 seconds between recipients',
@@ -1299,14 +1234,9 @@ export async function deliverBroadcast(
     );
 
     // --------------------------------------------------------
-    // Phone variants também são sequenciais.
+    // Phone variants
     //
-    // IMPORTANTE:
-    //
-    // NÃO existe delay aqui.
-    //
-    // Se a primeira variante falhar com erro que permita
-    // tentar outra variante, a próxima é chamada imediatamente.
+    // SEM delay entre variantes.
     // --------------------------------------------------------
 
     for (
@@ -1326,13 +1256,6 @@ export async function deliverBroadcast(
               variant,
           },
         );
-
-        // ======================================================
-        // CRÍTICO:
-        //
-        // O próximo recipient NÃO começa antes deste await
-        // terminar.
-        // ======================================================
 
         const result =
           await sendTemplateMessage({
@@ -1451,11 +1374,7 @@ export async function deliverBroadcast(
           },
         );
 
-        // ------------------------------------------------------
-        // NÃO adicionar delay aqui.
-        //
-        // A próxima variante será tentada imediatamente.
-        // ------------------------------------------------------
+        // Próxima variante imediatamente.
       }
     }
 
@@ -1463,9 +1382,7 @@ export async function deliverBroadcast(
     // SUCCESS
     // ----------------------------------------------------------
 
-    if (
-      sentMessageId
-    ) {
+    if (sentMessageId) {
       const sentAt =
         new Date().toISOString();
 
@@ -1473,12 +1390,9 @@ export async function deliverBroadcast(
         error:
           recipientUpdateError,
       } = await db
-        .from(
-          'broadcast_recipients',
-        )
+        .from('broadcast_recipients')
         .update({
-          status:
-            'sent',
+          status: 'sent',
 
           sent_at:
             sentAt,
@@ -1494,9 +1408,7 @@ export async function deliverBroadcast(
           recipient.recipientRowId,
         );
 
-      if (
-        recipientUpdateError
-      ) {
+      if (recipientUpdateError) {
         console.error(
           '[broadcast-core] failed updating broadcast recipient:',
           recipientUpdateError,
@@ -1504,12 +1416,6 @@ export async function deliverBroadcast(
       }
 
       sent++;
-
-      // --------------------------------------------------------
-      // Meta já aceitou.
-      //
-      // Persistência é aguardada antes do próximo recipient.
-      // --------------------------------------------------------
 
       await persistBroadcastMessage(
         db,
@@ -1565,9 +1471,7 @@ export async function deliverBroadcast(
         error:
           recipientUpdateError,
       } = await db
-        .from(
-          'broadcast_recipients',
-        )
+        .from('broadcast_recipients')
         .update({
           status:
             'failed',
@@ -1580,9 +1484,7 @@ export async function deliverBroadcast(
           recipient.recipientRowId,
         );
 
-      if (
-        recipientUpdateError
-      ) {
+      if (recipientUpdateError) {
         console.error(
           '[broadcast-core] failed marking recipient failed:',
           recipientUpdateError,
@@ -1617,28 +1519,21 @@ export async function deliverBroadcast(
             startedAt,
         },
       );
-
-      // Não lança erro.
-      //
-      // O próximo recipient continua depois do delay.
     }
 
     // ----------------------------------------------------------
     // DELAY ENTRE DESTINATÁRIOS
     // ----------------------------------------------------------
     //
-    // Este é o único lugar onde existe espera entre
-    // destinatários.
+    // SOMENTE aqui existe o delay.
     //
-    // IMPORTANTE:
+    // sucesso -> delay
+    // falha -> delay
     //
-    // - sucesso -> delay
-    // - falha -> delay
-    // - variante 1 -> variante 2 = SEM delay
-    // - variante 2 -> variante 3 = SEM delay
+    // variante 1 -> variante 2 = sem delay
+    // variante 2 -> variante 3 = sem delay
     //
-    // Não há necessidade de esperar depois do último
-    // destinatário do pass.
+    // Não espera depois do último recipient do pass.
     // ----------------------------------------------------------
 
     if (
@@ -1667,8 +1562,7 @@ export async function deliverBroadcast(
 
       failed,
 
-      concurrency:
-        1,
+      concurrency: 1,
     },
   );
 
@@ -1735,10 +1629,6 @@ export async function finalizeBroadcastStatus(
       'pending',
     );
 
-  // ----------------------------------------------------------
-  // Ainda há recipients.
-  // ----------------------------------------------------------
-
   if (
     pending > 0
   ) {
@@ -1752,10 +1642,6 @@ export async function finalizeBroadcastStatus(
 
     return;
   }
-
-  // ----------------------------------------------------------
-  // Nenhum pending.
-  // ----------------------------------------------------------
 
   const failed =
     await countWhere(

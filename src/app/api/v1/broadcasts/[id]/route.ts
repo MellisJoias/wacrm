@@ -36,15 +36,6 @@ import {
 //
 // O endpoint trabalha em PASS.
 //
-// Exemplo:
-//
-//   1000 recipients
-//
-//   PASS 1 -> 50
-//   PASS 2 -> 50
-//   PASS 3 -> 50
-//   ...
-//
 // Cada recipient dentro do pass continua sendo enviado
 // estritamente um por vez.
 // ============================================================
@@ -53,16 +44,6 @@ export const maxDuration = 300;
 
 // ============================================================
 // Internal continuation authentication
-// ============================================================
-//
-// O próprio servidor chama este endpoint para continuar uma
-// campanha.
-//
-// Não usamos sessão do navegador para isso.
-//
-// Configure na Vercel:
-//
-// BROADCAST_INTERNAL_SECRET=um_valor_longo_e_aleatorio
 // ============================================================
 
 function isInternalRequest(
@@ -93,11 +74,13 @@ function isInternalRequest(
 
 // ============================================================
 // Internal resume trigger
-// ============================================================
 //
-// Chamado pelo próprio servidor quando ainda existem pending.
+// A continuação automática chama a rota central de broadcast:
 //
-// Usa fetch contra a própria aplicação.
+// /api/v1/broadcasts/[id]
+//
+// Essa rota possui suporte à autenticação interna através de
+// BROADCAST_INTERNAL_SECRET.
 // ============================================================
 
 async function triggerNextPass(
@@ -120,9 +103,9 @@ async function triggerNextPass(
     new URL(request.url).origin;
 
   const url =
-    `${origin}/api/whatsapp/broadcast/${encodeURIComponent(
+    `${origin}/api/v1/broadcasts/${encodeURIComponent(
       broadcastId,
-    )}/resume`;
+    )}`;
 
   try {
     console.log(
@@ -236,9 +219,6 @@ export async function POST(
     if (internal) {
       // ------------------------------------------------------
       // Internal server continuation
-      //
-      // We intentionally use service-role here because the
-      // request originated from our own server.
       // ------------------------------------------------------
 
       const admin =
@@ -436,9 +416,6 @@ export async function POST(
 
         // ----------------------------------------------------
         // Determine whether pending recipients remain.
-        //
-        // finalizeBroadcastStatus() leaves the campaign as
-        // "sending" while pending rows exist.
         // ----------------------------------------------------
 
         const {
@@ -513,8 +490,8 @@ export async function POST(
         // ------------------------------------------------------
         // If pending remain, immediately schedule the next pass.
         //
-        // This happens AFTER releasing the lock, otherwise the
-        // next request could receive HTTP 409.
+        // The next pass uses the internal server endpoint and
+        // processes only pending recipients.
         // ------------------------------------------------------
 
         if (

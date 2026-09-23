@@ -45,11 +45,146 @@ import { supabaseAdmin } from '@/lib/flows/admin-client';
 //   -> salva resultado
 //   -> próximo destinatário
 //
+// Cada pass envia no máximo DELIVERY_BATCH_SIZE recipients.
+//
 // Quando o lote termina e ainda existem pending,
-// o próprio delivery agenda automaticamente o próximo pass.
+// o servidor dispara automaticamente o próximo pass.
+//
+// O intervalo de 20 segundos entre blocos é controlado
+// exclusivamente pela rota de continuação [id]/route.ts.
 // ============================================================
 
 export const maxDuration = 300;
+
+// ============================================================
+// Internal continuation
+// ============================================================
+//
+// Depois que o primeiro lote termina, esta função chama a rota
+// central de continuação:
+//
+// /api/v1/broadcasts/[id]
+//
+// Essa rota já possui:
+// - controle de lock
+// - planejamento do próximo lote
+// - limite de 12 por pass
+// - envio sequencial
+// - verificação dos pending
+// - espera de 20 segundos entre os passes
+// - continuação automática dos próximos passes
+//
+// A autenticação interna utiliza BROADCAST_INTERNAL_SECRET.
+// ============================================================
+
+async function triggerNextBroadcastPass(
+  request: Request,
+  broadcastId: string,
+): Promise<void> {
+  const secret =
+    process.env.BROADCAST_INTERNAL_SECRET;
+
+  if (
+    !secret ||
+    secret.length === 0
+  ) {
+    console.error(
+      '[broadcast-resume] BROADCAST_INTERNAL_SECRET is not configured. Automatic continuation cannot run.',
+    );
+
+    return;
+  }
+
+  const origin =
+    new URL(request.url).origin;
+
+  const url =
+    `${origin}/api/v1/broadcasts/${encodeURIComponent(
+      broadcastId,
+    )}`;
+
+  try {
+    console.log(
+      '[broadcast-resume] triggering next delivery pass:',
+      {
+        broadcastId,
+        url,
+      },
+    );
+
+    const response =
+      await fetch(
+        url,
+        {
+          method: 'POST',
+
+          headers: {
+            'content-type':
+              'application/json',
+
+            'x-broadcast-internal-secret':
+              secret,
+          },
+
+          body:
+            JSON.stringify({
+              scope: 'pending',
+            }),
+
+          cache:
+            'no-store',
+        },
+      );
+
+    const text =
+      await response
+        .text()
+        .catch(
+          () => '',
+        );
+
+    if (
+      !response.ok
+    ) {
+      console.error(
+        '[broadcast-resume] next pass returned non-2xx:',
+        {
+          broadcastId,
+
+          status:
+            response.status,
+
+          body:
+            text,
+        },
+      );
+
+      return;
+    }
+
+    console.log(
+      '[broadcast-resume] next delivery pass accepted:',
+      {
+        broadcastId,
+
+        status:
+          response.status,
+
+        body:
+          text,
+      },
+    );
+  } catch (error) {
+    console.error(
+      '[broadcast-resume] failed to trigger next pass:',
+      {
+        broadcastId,
+
+        error,
+      },
+    );
+  }
+}
 
 type BroadcastAuthContext = {
   supabase: Awaited<
@@ -60,7 +195,9 @@ type BroadcastAuthContext = {
 
   userId: string;
 
-  authType: 'session' | 'api_key';
+  authType:
+    | 'session'
+    | 'api_key';
 };
 
 // ============================================================
@@ -71,7 +208,9 @@ async function resolveBroadcastAuth(
   request: Request,
 ): Promise<BroadcastAuthContext> {
   const authorization =
-    request.headers.get('authorization');
+    request.headers.get(
+      'authorization',
+    );
 
   // ----------------------------------------------------------
   // Public API
@@ -153,7 +292,9 @@ export async function POST(
     const body =
       (await request
         .json()
-        .catch(() => null)) as Record<
+        .catch(
+          () => null,
+        )) as Record<
         string,
         unknown
       > | null;
@@ -258,14 +399,15 @@ export async function POST(
       );
 
     // ----------------------------------------------------------
-    // IMPORTANTE
+    // First delivery pass
+    // ----------------------------------------------------------
     //
     // O broadcast pode conter centenas de recipients.
     //
     // Não enviamos todos dentro de uma única execução.
     //
-    // O primeiro pass recebe somente o tamanho definido no
-    // broadcast-core.ts.
+    // O primeiro pass recebe somente o tamanho definido pelo
+    // DELIVERY_BATCH_SIZE no broadcast-core.ts.
     // ----------------------------------------------------------
 
     const firstPass =
@@ -281,6 +423,9 @@ export async function POST(
     // ----------------------------------------------------------
 
     after(async () => {
+      let shouldContinue =
+        false;
+
       try {
         console.log(
           '[POST /api/v1/broadcasts] starting first delivery pass:',
@@ -296,6 +441,10 @@ export async function POST(
           },
         );
 
+        // ------------------------------------------------------
+        // Send first pass sequentially.
+        // ------------------------------------------------------
+
         await deliverBroadcast(
           admin,
           firstPass,
@@ -306,6 +455,67 @@ export async function POST(
           {
             broadcastId:
               plan.broadcastId,
+          },
+        );
+
+        // ------------------------------------------------------
+        // Determine whether pending recipients remain.
+        // ------------------------------------------------------
+
+        const {
+          count:
+            pendingCount,
+
+          error:
+            pendingError,
+        } =
+          await admin
+            .from(
+              'broadcast_recipients',
+            )
+            .select(
+              'id',
+              {
+                count:
+                  'exact',
+
+                head:
+                  true,
+              },
+            )
+            .eq(
+              'broadcast_id',
+              plan.broadcastId,
+            )
+            .eq(
+              'status',
+              'pending',
+            );
+
+        if (
+          pendingError
+        ) {
+          console.error(
+            '[broadcast-resume] failed checking pending recipients:',
+            pendingError,
+          );
+
+          return;
+        }
+
+        shouldContinue =
+          (pendingCount ?? 0) > 0;
+
+        console.log(
+          '[broadcast-resume] first pass completed:',
+          {
+            broadcastId:
+              plan.broadcastId,
+
+            pending:
+              pendingCount ?? 0,
+
+            shouldContinue,
           },
         );
       } catch (error) {
@@ -323,6 +533,23 @@ export async function POST(
 
             error,
           },
+        );
+      }
+
+      // --------------------------------------------------------
+      // Automatically start next pass.
+      // --------------------------------------------------------
+      //
+      // A própria rota de continuação controla os 20 segundos
+      // antes do próximo bloco.
+      // --------------------------------------------------------
+
+      if (
+        shouldContinue
+      ) {
+        await triggerNextBroadcastPass(
+          request,
+          plan.broadcastId,
         );
       }
     });
@@ -347,6 +574,9 @@ export async function POST(
 
         rejected:
           plan.rejected,
+
+        automatic_continuation:
+          true,
       },
       202,
     );
@@ -376,7 +606,9 @@ export async function POST(
         err.status === 400
           ? 'bad_request'
           : 'internal',
+
         err.message,
+
         err.status,
       );
     }
@@ -395,7 +627,9 @@ export async function POST(
         err.status === 401
           ? 'unauthorized'
           : 'forbidden',
+
         err.message,
+
         err.status,
       );
     }

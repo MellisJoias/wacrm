@@ -38,9 +38,46 @@ import {
 //
 // Cada recipient dentro do pass continua sendo enviado
 // estritamente um por vez.
+//
+// ENTRE UM PASS DE 12 E O PRÓXIMO:
+//     espera exatamente 20 segundos.
 // ============================================================
 
 export const maxDuration = 300;
+
+// ============================================================
+// Delay entre blocos
+// ============================================================
+
+const BROADCAST_BATCH_DELAY_MS =
+  20_000;
+
+async function waitBetweenBroadcastBatches(): Promise<void> {
+  console.log(
+    '[broadcast-resume] WAITING BETWEEN BATCHES',
+    {
+      delayMs:
+        BROADCAST_BATCH_DELAY_MS,
+
+      delaySeconds:
+        BROADCAST_BATCH_DELAY_MS /
+        1000,
+    },
+  );
+
+  await new Promise<void>(
+    (resolve) => {
+      setTimeout(
+        resolve,
+        BROADCAST_BATCH_DELAY_MS,
+      );
+    },
+  );
+
+  console.log(
+    '[broadcast-resume] BATCH DELAY FINISHED',
+  );
+}
 
 // ============================================================
 // Internal continuation authentication
@@ -79,8 +116,7 @@ function isInternalRequest(
 //
 // /api/v1/broadcasts/[id]
 //
-// Essa rota possui suporte à autenticação interna através de
-// BROADCAST_INTERNAL_SECRET.
+// Antes de iniciar o próximo pass, espera 20 segundos.
 // ============================================================
 
 async function triggerNextPass(
@@ -98,6 +134,12 @@ async function triggerNextPass(
 
     return;
   }
+
+  // ----------------------------------------------------------
+  // Espera fixa de 20 segundos entre os blocos.
+  // ----------------------------------------------------------
+
+  await waitBetweenBroadcastBatches();
 
   const origin =
     new URL(request.url).origin;
@@ -142,15 +184,21 @@ async function triggerNextPass(
     const text =
       await response
         .text()
-        .catch(() => '');
+        .catch(
+          () => '',
+        );
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
       console.error(
         '[broadcast-resume] next pass returned non-2xx:',
         {
           broadcastId,
+
           status:
             response.status,
+
           body:
             text,
         },
@@ -163,8 +211,10 @@ async function triggerNextPass(
       '[broadcast-resume] next delivery pass accepted:',
       {
         broadcastId,
+
         status:
           response.status,
+
         body:
           text,
       },
@@ -174,6 +224,7 @@ async function triggerNextPass(
       '[broadcast-resume] failed to trigger next pass:',
       {
         broadcastId,
+
         error,
       },
     );
@@ -419,8 +470,11 @@ export async function POST(
         // ----------------------------------------------------
 
         const {
-          count: pendingCount,
-          error: pendingError,
+          count:
+            pendingCount,
+
+          error:
+            pendingError,
         } = await admin
           .from(
             'broadcast_recipients',
@@ -430,6 +484,7 @@ export async function POST(
             {
               count:
                 'exact',
+
               head:
                 true,
             },
@@ -443,7 +498,9 @@ export async function POST(
             'pending',
           );
 
-        if (pendingError) {
+        if (
+          pendingError
+        ) {
           console.error(
             '[broadcast-resume] failed checking pending recipients:',
             pendingError,
@@ -488,10 +545,10 @@ export async function POST(
         );
 
         // ------------------------------------------------------
-        // If pending remain, immediately schedule the next pass.
+        // If pending remain, schedule next pass.
         //
-        // The next pass uses the internal server endpoint and
-        // processes only pending recipients.
+        // triggerNextPass() waits exactly 20 seconds before
+        // starting the next block.
         // ------------------------------------------------------
 
         if (
@@ -511,7 +568,8 @@ export async function POST(
 
     return NextResponse.json(
       {
-        success: true,
+        success:
+          true,
 
         broadcast_id:
           id,
@@ -529,7 +587,8 @@ export async function POST(
           true,
       },
       {
-        status: 202,
+        status:
+          202,
       },
     );
   } catch (error) {

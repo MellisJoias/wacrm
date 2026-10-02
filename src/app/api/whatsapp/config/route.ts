@@ -1,12 +1,35 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { createClient as createAdminClient } from '@supabase/supabase-js'
+import {
+  createClient as createAdminClient,
+  type SupabaseClient,
+} from '@supabase/supabase-js'
 import {
   registerPhoneNumber,
   subscribeWabaToApp,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
-import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
+import {
+  encrypt,
+  decrypt,
+} from '@/lib/whatsapp/encryption'
+
+type WhatsAppConfig = {
+  id: string
+  business_portfolio_id: string | null
+  display_name: string | null
+  phone_number_id: string
+  waba_id: string | null
+  access_token: string
+  status: string | null
+}
+
+type ExistingConfig = {
+  id: string
+  registered_at: string | null
+  phone_number_id: string
+  waba_id: string | null
+}
 
 /**
  * Resolve the caller's account_id from their profile.
@@ -21,13 +44,15 @@ async function resolveAccountId(
     .eq('user_id', userId)
     .maybeSingle()
 
-  if (error || !data?.account_id) return null
+  if (error || !data?.account_id) {
+    return null
+  }
 
   return data.account_id as string
 }
 
 // Lazy-initialised service-role client.
-let _adminClient: any = null
+let _adminClient: SupabaseClient | null = null
 
 function supabaseAdmin() {
   if (!_adminClient) {
@@ -65,16 +90,19 @@ export async function GET(request: Request) {
 
     if (authError || !user) {
       return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 },
+        {
+          error: 'Unauthorized',
+        },
+        {
+          status: 401,
+        },
       )
     }
 
-    const accountId =
-      await resolveAccountId(
-        supabase,
-        user.id,
-      )
+    const accountId = await resolveAccountId(
+      supabase,
+      user.id,
+    )
 
     if (!accountId) {
       return NextResponse.json(
@@ -84,22 +112,22 @@ export async function GET(request: Request) {
           message:
             'Your profile is not linked to an account.',
         },
-        { status: 200 },
+        {
+          status: 200,
+        },
       )
     }
 
-    const url =
-      new URL(request.url)
+    const url = new URL(request.url)
 
     const requestedConfigId =
       url.searchParams.get(
         'whatsapp_config_id',
       )
 
-    // ----------------------------------------------------------
-    // Specific configuration
-    // ----------------------------------------------------------
-
+    /*
+     * Specific WhatsApp configuration
+     */
     if (requestedConfigId) {
       const {
         data: config,
@@ -132,7 +160,9 @@ export async function GET(request: Request) {
             message:
               'Failed to fetch configuration',
           },
-          { status: 200 },
+          {
+            status: 200,
+          },
         )
       }
 
@@ -144,19 +174,20 @@ export async function GET(request: Request) {
             message:
               'WhatsApp configuration not found.',
           },
-          { status: 200 },
+          {
+            status: 200,
+          },
         )
       }
 
       return verifyConfig(
-        config,
+        config as WhatsAppConfig,
       )
     }
 
-    // ----------------------------------------------------------
-    // All configurations
-    // ----------------------------------------------------------
-
+    /*
+     * All WhatsApp configurations
+     */
     const {
       data: configs,
       error: configsError,
@@ -171,7 +202,9 @@ export async function GET(request: Request) {
       )
       .order(
         'created_at',
-        { ascending: true },
+        {
+          ascending: true,
+        },
       )
 
     if (configsError) {
@@ -187,7 +220,9 @@ export async function GET(request: Request) {
           message:
             'Failed to fetch configuration',
         },
-        { status: 200 },
+        {
+          status: 200,
+        },
       )
     }
 
@@ -200,24 +235,29 @@ export async function GET(request: Request) {
             'No WhatsApp configuration saved yet. Fill in the form and click Save Configuration.',
           configs: [],
         },
-        { status: 200 },
+        {
+          status: 200,
+        },
       )
     }
 
-    // Preserve the old single-config response shape when
-    // there is exactly one configuration.
+    /*
+     * Preserve the old single-config response.
+     */
     if (configs.length === 1) {
       return verifyConfig(
-        configs[0],
+        configs[0] as WhatsAppConfig,
       )
     }
 
-    // Multiple WhatsApp numbers.
+    /*
+     * Multiple WhatsApp numbers.
+     */
     return NextResponse.json({
       connected: true,
       multiple_configs: true,
       configs: configs.map(
-        (config: any) => ({
+        (config) => ({
           id: config.id,
           business_portfolio_id:
             config.business_portfolio_id,
@@ -245,24 +285,25 @@ export async function GET(request: Request) {
         message:
           'Internal server error',
       },
-      { status: 500 },
+      {
+        status: 500,
+      },
     )
   }
 }
 
 /**
- * Verifies one stored WhatsApp configuration against Meta.
+ * Verify one stored WhatsApp configuration against Meta.
  */
 async function verifyConfig(
-  config: any,
+  config: WhatsAppConfig,
 ) {
   let accessToken: string
 
   try {
-    accessToken =
-      decrypt(
-        config.access_token,
-      )
+    accessToken = decrypt(
+      config.access_token,
+    )
   } catch (err) {
     console.error(
       '[whatsapp/config GET] Token decryption failed:',
@@ -279,7 +320,9 @@ async function verifyConfig(
         message:
           'The stored access token cannot be decrypted with the current ENCRYPTION_KEY. This usually means the key changed, or it differs between environments. Reset and re-save this WhatsApp configuration.',
       },
-      { status: 200 },
+      {
+        status: 200,
+      },
     )
   }
 
@@ -322,7 +365,9 @@ async function verifyConfig(
         message:
           `Meta API rejected the credentials: ${message}`,
       },
-      { status: 200 },
+      {
+        status: 200,
+      },
     )
   }
 }
@@ -332,14 +377,16 @@ async function verifyConfig(
  *
  * Creates or updates a WhatsApp configuration.
  *
- * When whatsapp_config_id is supplied:
- *   updates that specific configuration.
+ * create_new === true
+ *   -> always creates a new configuration.
  *
- * When whatsapp_config_id is omitted:
- *   - updates the only existing configuration when exactly one exists
- *   - creates a new configuration when none exists
- *   - refuses the request when multiple configurations already exist,
- *     because silently selecting a number would be unsafe.
+ * whatsapp_config_id
+ *   -> updates that specific configuration.
+ *
+ * No id
+ *   -> updates the only configuration when exactly one exists.
+ *   -> creates when none exists.
+ *   -> refuses when multiple configurations already exist.
  */
 export async function POST(
   request: Request,
@@ -392,6 +439,7 @@ export async function POST(
 
     const {
       whatsapp_config_id,
+      create_new,
       business_portfolio_id,
       display_name,
       phone_number_id,
@@ -437,13 +485,22 @@ export async function POST(
       }
     }
 
-    // ----------------------------------------------------------
-    // Resolve target configuration
-    // ----------------------------------------------------------
+    /*
+     * Resolve target configuration.
+     */
+    let existing:
+      ExistingConfig | null =
+      null
 
-    let existing: any = null
-
-    if (
+    /*
+     * Explicitly creating a new configuration.
+     *
+     * This is the important part for multiple WhatsApp numbers:
+     * existing remains null, so the code below performs INSERT.
+     */
+    if (create_new === true) {
+      existing = null
+    } else if (
       typeof whatsapp_config_id ===
         'string' &&
       whatsapp_config_id.trim()
@@ -495,7 +552,8 @@ export async function POST(
         )
       }
 
-      existing = data
+      existing =
+        data as ExistingConfig
     } else {
       const {
         data: configs,
@@ -538,7 +596,7 @@ export async function POST(
         configs.length === 1
       ) {
         existing =
-          configs[0]
+          configs[0] as ExistingConfig
       } else if (
         configs &&
         configs.length > 1
@@ -555,14 +613,10 @@ export async function POST(
       }
     }
 
-    // ----------------------------------------------------------
-    // Phone ownership
-    // ----------------------------------------------------------
-    //
-    // A phone_number_id can belong to only one WACRM account,
-    // but an account may have multiple phone numbers.
-    // ----------------------------------------------------------
-
+    /*
+     * Prevent the same phone number from belonging
+     * to another account.
+     */
     const {
       data: claimed,
       error: claimedError,
@@ -611,10 +665,9 @@ export async function POST(
       )
     }
 
-    // ----------------------------------------------------------
-    // Verify credentials with Meta
-    // ----------------------------------------------------------
-
+    /*
+     * Verify credentials with Meta.
+     */
     let phoneInfo
 
     try {
@@ -647,11 +700,11 @@ export async function POST(
       )
     }
 
-    // ----------------------------------------------------------
-    // Encrypt credentials
-    // ----------------------------------------------------------
-
+    /*
+     * Encrypt credentials.
+     */
     let encryptedAccessToken: string
+
     let encryptedVerifyToken:
       | string
       | null
@@ -690,10 +743,9 @@ export async function POST(
       )
     }
 
-    // ----------------------------------------------------------
-    // Registration
-    // ----------------------------------------------------------
-
+    /*
+     * Registration.
+     */
     const sameNumber =
       existing?.phone_number_id ===
         phone_number_id &&
@@ -754,10 +806,9 @@ export async function POST(
       }
     }
 
-    // ----------------------------------------------------------
-    // Subscribe WABA to app
-    // ----------------------------------------------------------
-
+    /*
+     * Subscribe WABA to app.
+     */
     let subscribedAppsAt:
       | string
       | null =
@@ -787,10 +838,9 @@ export async function POST(
       }
     }
 
-    // ----------------------------------------------------------
-    // Persist
-    // ----------------------------------------------------------
-
+    /*
+     * Data persisted in whatsapp_config.
+     */
     const baseRow = {
       business_portfolio_id:
         business_portfolio_id ||
@@ -847,6 +897,9 @@ export async function POST(
       existing?.id ??
       null
 
+    /*
+     * Existing configuration -> UPDATE.
+     */
     if (existing) {
       const {
         error: updateError,
@@ -881,6 +934,9 @@ export async function POST(
         )
       }
     } else {
+      /*
+       * New configuration -> INSERT.
+       */
       const {
         data: inserted,
         error: insertError,
@@ -919,10 +975,9 @@ export async function POST(
         inserted.id
     }
 
-    // ----------------------------------------------------------
-    // Response
-    // ----------------------------------------------------------
-
+    /*
+     * Response.
+     */
     if (
       registrationError
     ) {
@@ -977,8 +1032,8 @@ export async function POST(
  *
  *   ?whatsapp_config_id=<uuid>
  *
- * When the account has exactly one configuration, the id is optional
- * for backwards compatibility.
+ * When the account has exactly one configuration,
+ * the id is optional for backwards compatibility.
  */
 export async function DELETE(
   request: Request,
@@ -1034,7 +1089,9 @@ export async function DELETE(
         'whatsapp_config_id',
       )
 
-    // Backwards compatibility when the account has exactly one config.
+    /*
+     * Backwards compatibility when there is exactly one config.
+     */
     if (!configId) {
       const {
         data: configs,

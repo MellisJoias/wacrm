@@ -897,7 +897,13 @@ describe(
 
             body_text:
               'Olá {{1}}, sua oferta é {{2}}.',
-          } as any,
+          } as {
+            id: string;
+            account_id: string;
+            name: string;
+            language: string;
+            body_text: string;
+          },
 
           planned: [
             {
@@ -1054,7 +1060,13 @@ describe(
 
             body_text:
               'Promo para {{1}}',
-          } as any,
+          } as {
+            id: string;
+            account_id: string;
+            name: string;
+            language: string;
+            body_text: string;
+          },
 
           planned: [
             {
@@ -1359,7 +1371,13 @@ describe(
 
             body_text:
               'Promo {{1}}',
-          } as any,
+          } as {
+            id: string;
+            account_id: string;
+            name: string;
+            language: string;
+            body_text: string;
+          },
 
           planned: [
             {

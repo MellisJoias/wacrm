@@ -86,9 +86,7 @@ vi.mock('@supabase/supabase-js', () => ({
               h.state.mirrorInboundMedia,
           }
 
-          let chain: Record<string, unknown>
-
-          chain = {
+          const chain: Record<string, unknown> = {
             eq: () => chain,
             in: () => chain,
             order: () => chain,

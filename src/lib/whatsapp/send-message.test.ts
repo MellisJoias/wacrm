@@ -25,10 +25,14 @@ async function expectSendError(
   await expect(
     sendMessageToConversation(noDb(), 'acct-1', params)
   ).rejects.toBeInstanceOf(SendMessageError);
+
   await sendMessageToConversation(noDb(), 'acct-1', params).catch(
     (e: SendMessageError) => {
       expect(e.status).toBe(status);
-      if (messageMatch) expect(e.message).toMatch(messageMatch);
+
+      if (messageMatch) {
+        expect(e.message).toMatch(messageMatch);
+      }
     }
   );
 }
@@ -37,13 +41,29 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
   const base = { conversationId: 'cv-1' };
 
   it('requires conversation_id and message_type', async () => {
-    await expectSendError({ conversationId: '', messageType: 'text' }, 400);
-    await expectSendError({ conversationId: 'cv-1', messageType: '' }, 400);
+    await expectSendError(
+      {
+        conversationId: '',
+        messageType: 'text',
+      },
+      400
+    );
+
+    await expectSendError(
+      {
+        conversationId: 'cv-1',
+        messageType: '',
+      },
+      400
+    );
   });
 
   it('rejects an unsupported message_type', async () => {
     await expectSendError(
-      { ...base, messageType: 'carrier-pigeon' },
+      {
+        ...base,
+        messageType: 'carrier-pigeon',
+      },
       400,
       /Unsupported message_type/
     );
@@ -51,7 +71,10 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
 
   it('requires content_text for text messages', async () => {
     await expectSendError(
-      { ...base, messageType: 'text' },
+      {
+        ...base,
+        messageType: 'text',
+      },
       400,
       /content_text is required/
     );
@@ -59,16 +82,27 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
 
   it('requires template_name for template messages', async () => {
     await expectSendError(
-      { ...base, messageType: 'template' },
+      {
+        ...base,
+        messageType: 'template',
+      },
       400,
       /template_name is required/
     );
   });
 
   it('requires media_url for media kinds', async () => {
-    for (const kind of ['image', 'video', 'document', 'audio']) {
+    for (const kind of [
+      'image',
+      'video',
+      'document',
+      'audio',
+    ]) {
       await expectSendError(
-        { ...base, messageType: kind },
+        {
+          ...base,
+          messageType: kind,
+        },
         400,
         /media_url is required/
       );
@@ -91,10 +125,14 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
   it('requires a valid interactive payload for interactive messages', async () => {
     // Missing payload entirely.
     await expectSendError(
-      { ...base, messageType: 'interactive' },
+      {
+        ...base,
+        messageType: 'interactive',
+      },
       400,
       /payload is required/
     );
+
     // Too many buttons.
     await expectSendError(
       {
@@ -114,6 +152,7 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
       400,
       /at most 3 buttons/
     );
+
     // Over-long button title.
     await expectSendError(
       {
@@ -122,7 +161,12 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
         interactivePayload: {
           kind: 'buttons',
           body: 'Pick one',
-          buttons: [{ id: 'a', title: 'x'.repeat(21) }],
+          buttons: [
+            {
+              id: 'a',
+              title: 'x'.repeat(21),
+            },
+          ],
         },
       },
       400,
@@ -136,7 +180,11 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
     const spy = vi.fn(() => {
       throw new Error('reached DB');
     });
-    const db = { from: spy } as unknown as SupabaseClient;
+
+    const db = {
+      from: spy,
+    } as unknown as SupabaseClient;
+
     await expect(
       sendMessageToConversation(db, 'acct-1', {
         ...base,
@@ -145,13 +193,21 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
         contentText: 'a'.repeat(2000),
       })
     ).rejects.toThrow('reached DB');
-    expect(spy).toHaveBeenCalledWith('conversations');
+
+    expect(spy).toHaveBeenCalledWith(
+      'conversations'
+    );
   });
 });
 
 describe('SendMessageError', () => {
   it('carries a machine code and an HTTP status', () => {
-    const e = new SendMessageError('meta_error', 'boom', 502);
+    const e = new SendMessageError(
+      'meta_error',
+      'boom',
+      502
+    );
+
     expect(e.code).toBe('meta_error');
     expect(e.status).toBe(502);
     expect(e).toBeInstanceOf(Error);
@@ -162,18 +218,49 @@ describe('SendMessageError', () => {
 // Full send path — what actually lands in `messages` (issue #483).
 // ============================================================
 
-const sendTemplateMessage = vi.fn(async () => ({ messageId: 'wamid.1' }));
+const sendTemplateMessage = vi.fn(
+  async () => ({
+    messageId: 'wamid.1',
+  })
+);
 
 // Stub only the senders — the module also exports INTERACTIVE_LIMITS,
 // which `interactive.ts` needs for the payload validation covered above.
 vi.mock('@/lib/whatsapp/meta-api', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  sendTextMessage: vi.fn(async () => ({ messageId: 'wamid.text' })),
-  sendTemplateMessage: (...args: unknown[]) =>
-    (sendTemplateMessage as unknown as (...a: unknown[]) => unknown)(...args),
-  sendMediaMessage: vi.fn(async () => ({ messageId: 'wamid.media' })),
-  sendInteractiveButtons: vi.fn(async () => ({ messageId: 'wamid.btn' })),
-  sendInteractiveList: vi.fn(async () => ({ messageId: 'wamid.list' })),
+
+  sendTextMessage: vi.fn(
+    async () => ({
+      messageId: 'wamid.text',
+    })
+  ),
+
+  sendTemplateMessage: (
+    ...args: unknown[]
+  ) =>
+    (
+      sendTemplateMessage as unknown as (
+        ...a: unknown[]
+      ) => unknown
+    )(...args),
+
+  sendMediaMessage: vi.fn(
+    async () => ({
+      messageId: 'wamid.media',
+    })
+  ),
+
+  sendInteractiveButtons: vi.fn(
+    async () => ({
+      messageId: 'wamid.btn',
+    })
+  ),
+
+  sendInteractiveList: vi.fn(
+    async () => ({
+      messageId: 'wamid.list',
+    })
+  ),
 }));
 
 vi.mock('@/lib/whatsapp/encryption', () => ({
@@ -187,7 +274,13 @@ vi.mock('@/lib/flows/admin-client', () => ({
   supabaseAdmin: () => ({
     from: () => ({
       update: () => ({
-        eq: () => ({ eq: () => ({ eq: async () => ({ error: null }) }) }),
+        eq: () => ({
+          eq: () => ({
+            eq: async () => ({
+              error: null,
+            }),
+          }),
+        }),
       }),
     }),
   }),
@@ -210,8 +303,17 @@ function sendPathDb(
 ): SupabaseClient {
   const conversation = {
     id: 'cv-1',
-    contact: { id: 'ct-1', phone: '+15551234567' },
+
+    // The send path requires the conversation to be associated
+    // with a WhatsApp configuration.
+    whatsapp_config_id: 'cfg-1',
+
+    contact: {
+      id: 'ct-1',
+      phone: '+15551234567',
+    },
   };
+
   const config = {
     id: 'cfg-1',
     phone_number_id: 'pn-1',
@@ -222,33 +324,84 @@ function sendPathDb(
     from(table: string) {
       const builder: Record<string, unknown> = {
         select: () => builder,
+
         eq: () => builder,
-        insert: (row: Record<string, unknown>) => {
-          if (table === 'messages') captured.message = row;
+
+        insert: (
+          row: Record<string, unknown>
+        ) => {
+          if (table === 'messages') {
+            captured.message = row;
+          }
+
           return builder;
         },
-        update: (row: Record<string, unknown>) => {
-          if (table === 'conversations') captured.conversation = row;
+
+        update: (
+          row: Record<string, unknown>
+        ) => {
+          if (table === 'conversations') {
+            captured.conversation = row;
+          }
+
           return builder;
         },
-        maybeSingle: async () => ({ data: null, error: null }),
+
+        maybeSingle: async () => ({
+          data: null,
+          error: null,
+        }),
+
         single: async () => {
           if (table === 'conversations') {
-            return { data: conversation, error: null };
+            return {
+              data: conversation,
+              error: null,
+            };
           }
-          if (table === 'whatsapp_config') return { data: config, error: null };
+
+          if (
+            table === 'whatsapp_config'
+          ) {
+            return {
+              data: config,
+              error: null,
+            };
+          }
+
           if (table === 'messages') {
-            return { data: { id: 'msg-1' }, error: null };
+            return {
+              data: {
+                id: 'msg-1',
+              },
+              error: null,
+            };
           }
-          return { data: null, error: null };
+
+          return {
+            data: null,
+            error: null,
+          };
         },
+
         // Bare-await result — only message_templates is read this way.
-        then: (resolve: (r: { data: unknown[]; error: null }) => unknown) =>
+        then: (
+          resolve: (
+            r: {
+              data: unknown[];
+              error: null;
+            }
+          ) => unknown
+        ) =>
           resolve({
-            data: table === 'message_templates' ? templateRows : [],
+            data:
+              table === 'message_templates'
+                ? templateRows
+                : [],
             error: null,
           }),
       };
+
       return builder;
     },
   } as unknown as SupabaseClient;
@@ -260,89 +413,200 @@ const TEMPLATE_ROW = {
   name: 'order_update',
   category: 'Utility',
   language: 'en',
-  body_text: 'Your order {{1}} ships on {{2}}',
-  created_at: '2026-01-01T00:00:00Z',
+  body_text:
+    'Your order {{1}} ships on {{2}}',
+  created_at:
+    '2026-01-01T00:00:00Z',
 };
 
-describe('sendMessageToConversation — template persistence (#483)', () => {
-  it('stores the substituted body when the caller sends no text', async () => {
-    const captured: CapturedWrites = {};
-    const result = await sendMessageToConversation(
-      sendPathDb([TEMPLATE_ROW], captured),
-      'acct-1',
-      {
-        conversationId: 'cv-1',
-        messageType: 'template',
-        templateName: 'order_update',
-        templateParams: ['A123', 'Friday'],
+describe(
+  'sendMessageToConversation — template persistence (#483)',
+  () => {
+    it(
+      'stores the substituted body when the caller sends no text',
+      async () => {
+        const captured: CapturedWrites = {};
+
+        const result =
+          await sendMessageToConversation(
+            sendPathDb(
+              [TEMPLATE_ROW],
+              captured
+            ),
+            'acct-1',
+            {
+              conversationId: 'cv-1',
+              messageType: 'template',
+              templateName:
+                'order_update',
+              templateParams: [
+                'A123',
+                'Friday',
+              ],
+            }
+          );
+
+        expect(
+          result.whatsappMessageId
+        ).toBe('wamid.1');
+
+        // Was NULL before the fix — the Inbox rendered an empty bubble.
+        expect(
+          captured.message?.content_text
+        ).toBe(
+          'Your order A123 ships on Friday'
+        );
+
+        expect(
+          captured.message?.template_name
+        ).toBe('order_update');
+
+        // …and the conversation-list preview reads the body, not '[template]'.
+        expect(
+          captured.conversation
+            ?.last_message_text
+        ).toBe(
+          'Your order A123 ships on Friday'
+        );
       }
     );
 
-    expect(result.whatsappMessageId).toBe('wamid.1');
-    // Was NULL before the fix — the Inbox rendered an empty bubble.
-    expect(captured.message?.content_text).toBe(
-      'Your order A123 ships on Friday'
+    it(
+      'reads body values out of the structured params shape too',
+      async () => {
+        const captured: CapturedWrites = {};
+
+        await sendMessageToConversation(
+          sendPathDb(
+            [TEMPLATE_ROW],
+            captured
+          ),
+          'acct-1',
+          {
+            conversationId: 'cv-1',
+            messageType: 'template',
+            templateName:
+              'order_update',
+            templateMessageParams: {
+              body: [
+                'B456',
+                'Monday',
+              ],
+            },
+          }
+        );
+
+        expect(
+          captured.message?.content_text
+        ).toBe(
+          'Your order B456 ships on Monday'
+        );
+      }
     );
-    expect(captured.message?.template_name).toBe('order_update');
-    // …and the conversation-list preview reads the body, not '[template]'.
-    expect(captured.conversation?.last_message_text).toBe(
-      'Your order A123 ships on Friday'
+
+    it(
+      "does not override the composer's pre-rendered text",
+      async () => {
+        const captured: CapturedWrites = {};
+
+        await sendMessageToConversation(
+          sendPathDb(
+            [TEMPLATE_ROW],
+            captured
+          ),
+          'acct-1',
+          {
+            conversationId: 'cv-1',
+            messageType: 'template',
+            templateName:
+              'order_update',
+            templateParams: [
+              'A123',
+              'Friday',
+            ],
+            contentText:
+              'rendered by the composer',
+          }
+        );
+
+        expect(
+          captured.message?.content_text
+        ).toBe(
+          'rendered by the composer'
+        );
+      }
     );
-  });
 
-  it('reads body values out of the structured params shape too', async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateMessageParams: { body: ['B456', 'Monday'] },
-    });
-    expect(captured.message?.content_text).toBe(
-      'Your order B456 ships on Monday'
+    it(
+      "sends the local row's language when the caller names none",
+      async () => {
+        sendTemplateMessage.mockClear();
+
+        const captured: CapturedWrites = {};
+
+        await sendMessageToConversation(
+          sendPathDb(
+            [TEMPLATE_ROW],
+            captured
+          ),
+          'acct-1',
+          {
+            conversationId: 'cv-1',
+            messageType: 'template',
+            templateName:
+              'order_update',
+            templateParams: [
+              'A123',
+              'Friday',
+            ],
+          }
+        );
+
+        // Previously pinned to 'en_US', which matched no row and made Meta
+        // reject the send as a missing translation.
+        expect(
+          (
+            sendTemplateMessage.mock
+              .calls[0] as unknown as [
+              {
+                language: string;
+              }
+            ]
+          )[0].language
+        ).toBe('en');
+      }
     );
-  });
 
-  it("does not override the composer's pre-rendered text", async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-      contentText: 'rendered by the composer',
-    });
-    expect(captured.message?.content_text).toBe('rendered by the composer');
-  });
+    it(
+      'leaves content_text null when the account has no local template row',
+      async () => {
+        const captured: CapturedWrites = {};
 
-  it("sends the local row's language when the caller names none", async () => {
-    sendTemplateMessage.mockClear();
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-    });
-    // Previously pinned to 'en_US', which matched no row and made Meta
-    // reject the send as a missing translation.
-    expect(
-      (sendTemplateMessage.mock.calls[0] as unknown as [{ language: string }])[0]
-        .language
-    ).toBe('en');
-  });
+        await sendMessageToConversation(
+          sendPathDb([], captured),
+          'acct-1',
+          {
+            conversationId: 'cv-1',
+            messageType: 'template',
+            templateName:
+              'never_synced',
+            templateParams: [
+              'A123',
+            ],
+          }
+        );
 
-  it('leaves content_text null when the account has no local template row', async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'never_synced',
-      templateParams: ['A123'],
-    });
-    // Nothing to render from — the bubble falls back to the template
-    // name rather than inventing a body.
-    expect(captured.message?.content_text).toBeNull();
-    expect(captured.conversation?.last_message_text).toBe('[template]');
-  });
-});
+        // Nothing to render from — the bubble falls back to the template
+        // name rather than inventing a body.
+        expect(
+          captured.message?.content_text
+        ).toBeNull();
+
+        expect(
+          captured.conversation
+            ?.last_message_text
+        ).toBe('[template]');
+      }
+    );
+  }
+);

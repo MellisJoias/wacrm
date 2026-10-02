@@ -19,83 +19,171 @@ import {
 // Mocks
 // ============================================================
 
+let adminDbMock:
+  | SupabaseClient
+  | null = null;
+
+vi.mock('@/lib/supabase/admin', () => ({
+  createAdminClient: vi.fn(() => {
+    if (!adminDbMock) {
+      throw new Error(
+        'admin db mock not initialized',
+      );
+    }
+
+    return adminDbMock;
+  }),
+}));
+
 vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: () => 'plain-access-token',
 }));
 
 vi.mock('@/lib/api/v1/contacts', () => ({
-  findOrCreateContact: vi.fn(async () => ({
-    id: 'c1',
-  })),
+  findOrCreateContact: vi.fn(
+    async () => ({
+      id: 'c1',
+    }),
+  ),
 }));
 
 vi.mock('@/lib/whatsapp/meta-api', () => ({
-  sendTemplateMessage: vi.fn(async () => ({
-    messageId: 'wamid-test-1',
-  })),
+  sendTemplateMessage: vi.fn(
+    async () => ({
+      messageId:
+        'wamid-test-1',
+    }),
+  ),
 }));
 
-vi.mock('@/lib/whatsapp/resolve-conversation', () => ({
-  resolveConversationByPhone: vi.fn(async () => ({
-    conversationId: 'conv-1',
-    contactId: 'c1',
-    contactCreated: false,
-  })),
-}));
+vi.mock(
+  '@/lib/whatsapp/resolve-conversation',
+  () => ({
+    resolveConversationByPhone:
+      vi.fn(
+        async () => ({
+          conversationId:
+            'conv-1',
+          contactId:
+            'c1',
+          contactCreated:
+            false,
+        }),
+      ),
+  }),
+);
+
+const WHATSAPP_CONFIG_ID =
+  'config-1';
+
+const db =
+  {} as SupabaseClient;
 
 // ============================================================
-// Pure validation
+// CREATE BROADCAST VALIDATION
 // ============================================================
 
-const db = {} as SupabaseClient;
+describe(
+  'createBroadcast validation',
+  () => {
+    it(
+      'rejects a missing template_name',
+      async () => {
+        await expect(
+          createBroadcast(
+            db,
+            'acc',
+            'user',
+            {
+              whatsappConfigId:
+                WHATSAPP_CONFIG_ID,
 
-describe('createBroadcast validation', () => {
-  it('rejects a missing template_name', async () => {
-    await expect(
-      createBroadcast(db, 'acc', 'user', {
-        templateName: '',
-        recipients: [
-          {
-            to: '+14155550123',
-          },
-        ],
-      }),
-    ).rejects.toMatchObject({
-      code: 'bad_request',
-      status: 400,
-    });
-  });
+              templateName:
+                '',
 
-  it('rejects an empty recipient list', async () => {
-    await expect(
-      createBroadcast(db, 'acc', 'user', {
-        templateName: 'promo',
-        recipients: [],
-      }),
-    ).rejects.toBeInstanceOf(BroadcastError);
-  });
+              recipients: [
+                {
+                  to:
+                    '+14155550123',
+                },
+              ],
+            },
+          ),
+        ).rejects.toMatchObject({
+          code:
+            'bad_request',
 
-  it('rejects more than 1000 recipients', async () => {
-    const recipients = Array.from(
-      { length: 1001 },
-      () => ({
-        to: '+14155550123',
-      }),
+          status:
+            400,
+        });
+      },
     );
 
-    await expect(
-      createBroadcast(db, 'acc', 'user', {
-        templateName: 'promo',
-        recipients,
-      }),
-    ).rejects.toMatchObject({
-      status: 400,
-    });
-  });
-});
+    it(
+      'rejects an empty recipient list',
+      async () => {
+        await expect(
+          createBroadcast(
+            db,
+            'acc',
+            'user',
+            {
+              whatsappConfigId:
+                WHATSAPP_CONFIG_ID,
+
+              templateName:
+                'promo',
+
+              recipients: [],
+            },
+          ),
+        ).rejects.toBeInstanceOf(
+          BroadcastError,
+        );
+      },
+    );
+
+    it(
+      'rejects more than 1000 recipients',
+      async () => {
+        const recipients =
+          Array.from(
+            {
+              length:
+                1001,
+            },
+            () => ({
+              to:
+                '+14155550123',
+            }),
+          );
+
+        await expect(
+          createBroadcast(
+            db,
+            'acc',
+            'user',
+            {
+              whatsappConfigId:
+                WHATSAPP_CONFIG_ID,
+
+              templateName:
+                'promo',
+
+              recipients,
+            },
+          ),
+        ).rejects.toMatchObject({
+          status:
+            400,
+        });
+      },
+    );
+  },
+);
 
 // ============================================================
-// createBroadcast persistence
+// CREATE BROADCAST MOCK DB
 // ============================================================
 
 function makeDb(
@@ -110,68 +198,87 @@ function makeDb(
       args: unknown;
     }[],
 
-    usedDirectInsert: 0,
+    usedDirectInsert:
+      0,
   };
 
   const database = {
     from(table: string) {
-      // --------------------------------------------------------
-      // WhatsApp config
-      // --------------------------------------------------------
+      if (
+        table ===
+        'whatsapp_config'
+      ) {
+        const chain: Record<
+          string,
+          unknown
+        > = {
+          select: () =>
+            chain,
 
-      if (table === 'whatsapp_config') {
-        return {
-          select: () => ({
-            eq: () => ({
-              single: () =>
-                Promise.resolve({
-                  data: {
-                    phone_number_id: 'pn-1',
-                    access_token: 'enc',
-                  },
-                  error: null,
-                }),
-            }),
-          }),
-        };
-      }
+          eq: () =>
+            chain,
 
-      // --------------------------------------------------------
-      // Message templates
-      // --------------------------------------------------------
+          single: () =>
+            Promise.resolve({
+              data: {
+                id:
+                  WHATSAPP_CONFIG_ID,
 
-      if (table === 'message_templates') {
-        const chain: Record<string, unknown> = {
-          select: () => chain,
+                phone_number_id:
+                  'pn-1',
 
-          eq: () => chain,
+                access_token:
+                  'enc',
+              },
 
-          then: (
-            resolve: (
-              result: {
-                data: unknown[];
-                error: null;
-              }
-            ) => unknown,
-          ) =>
-            resolve({
-              data: [],
-              error: null,
+              error:
+                null,
             }),
         };
 
         return chain;
       }
 
-      // --------------------------------------------------------
-      // Direct inserts are forbidden.
-      //
-      // createBroadcast MUST use the atomic RPC.
-      // --------------------------------------------------------
+      if (
+        table ===
+        'message_templates'
+      ) {
+        const chain: Record<
+          string,
+          unknown
+        > = {
+          select: () =>
+            chain,
+
+          eq: () =>
+            chain,
+
+          then: (
+            resolve: (
+              result: {
+                data:
+                  unknown[];
+
+                error:
+                  null;
+              },
+            ) => unknown,
+          ) =>
+            resolve({
+              data: [],
+              error:
+                null,
+            }),
+        };
+
+        return chain;
+      }
 
       if (
-        table === 'broadcasts' ||
-        table === 'broadcast_recipients'
+        table ===
+          'broadcasts' ||
+        table ===
+          'broadcast_recipients'
       ) {
         calls.usedDirectInsert++;
 
@@ -181,9 +288,12 @@ function makeDb(
               single: () =>
                 Promise.resolve({
                   data: {
-                    id: 'orphan',
+                    id:
+                      'orphan',
                   },
-                  error: null,
+
+                  error:
+                    null,
                 }),
             }),
           }),
@@ -204,9 +314,14 @@ function makeDb(
         args,
       });
 
-      return Promise.resolve(rpcResult);
+      return Promise.resolve(
+        rpcResult,
+      );
     },
   } as unknown as SupabaseClient;
+
+  adminDbMock =
+    database;
 
   return {
     db: database,
@@ -214,205 +329,317 @@ function makeDb(
   };
 }
 
-describe('createBroadcast atomicity (#370)', () => {
-  it('creates parent + recipients through the atomic RPC, never a bare parent insert', async () => {
-    const { db, calls } = makeDb({
-      data: [
-        {
-          broadcast_id: 'b-1',
-          recipient_id: 'r-1',
-          contact_id: 'c1',
-        },
-      ],
-      error: null,
+// ============================================================
+// CREATE BROADCAST ATOMICITY
+// ============================================================
+
+describe(
+  'createBroadcast atomicity (#370)',
+  () => {
+    beforeEach(() => {
+      adminDbMock =
+        null;
     });
 
-    const plan = await createBroadcast(
-      db,
-      'acc',
-      'user',
-      {
-        templateName: 'promo',
-        recipients: [
-          {
-            to: '+14155550123',
-          },
-        ],
-      },
-    );
-
-    expect(calls.rpc).toHaveLength(1);
-
-    expect(
-      calls.rpc[0].name,
-    ).toBe(
-      'create_broadcast_with_recipients',
-    );
-
-    expect(
-      calls.usedDirectInsert,
-    ).toBe(0);
-
-    expect(
-      plan.broadcastId,
-    ).toBe('b-1');
-
-    expect(
-      plan.planned,
-    ).toEqual([
-      {
-        recipientRowId: 'r-1',
-        contactId: 'c1',
-        phone: '14155550123',
-        params: [],
-      },
-    ]);
-  });
-
-  it('passes frozen template params to the atomic RPC', async () => {
-    const { db, calls } = makeDb({
-      data: [
-        {
-          broadcast_id: 'b-1',
-          recipient_id: 'r-1',
-          contact_id: 'c1',
-        },
-      ],
-      error: null,
-    });
-
-    await createBroadcast(
-      db,
-      'acc',
-      'user',
-      {
-        templateName: 'promo',
-        recipients: [
-          {
-            to: '+14155550123',
-            params: [
-              'Maria',
-              'R$ 100,00',
-            ],
-          },
-        ],
-      },
-    );
-
-    expect(
-      calls.rpc,
-    ).toHaveLength(1);
-
-    const args =
-      calls.rpc[0].args as Record<
-        string,
-        unknown
-      >;
-
-    expect(
-      args.p_template_params,
-    ).toEqual([
-      [
-        'Maria',
-        'R$ 100,00',
-      ],
-    ]);
-
-    expect(
-      args.p_contact_ids,
-    ).toEqual(['c1']);
-  });
-
-  it('throws and leaves no orphaned parent when the atomic create fails', async () => {
-    const { db, calls } = makeDb({
-      data: null,
-      error: {
-        message:
-          'recipient insert failed',
-      },
-    });
-
-    await expect(
-      createBroadcast(
-        db,
-        'acc',
-        'user',
-        {
-          templateName: 'promo',
-          recipients: [
+    it(
+      'creates parent + recipients through the atomic RPC, never a bare parent insert',
+      async () => {
+        const {
+          db,
+          calls,
+        } = makeDb({
+          data: [
             {
-              to: '+14155550123',
+              broadcast_id:
+                'b-1',
+
+              recipient_id:
+                'r-1',
+
+              contact_id:
+                'c1',
             },
           ],
-        },
-      ),
-    ).rejects.toBeInstanceOf(
-      BroadcastError,
+
+          error:
+            null,
+        });
+
+        const plan =
+          await createBroadcast(
+            db,
+            'acc',
+            'user',
+            {
+              whatsappConfigId:
+                WHATSAPP_CONFIG_ID,
+
+              templateName:
+                'promo',
+
+              recipients: [
+                {
+                  to:
+                    '+14155550123',
+                },
+              ],
+            },
+          );
+
+        expect(
+          calls.rpc,
+        ).toHaveLength(
+          1,
+        );
+
+        expect(
+          calls.rpc[0]
+            .name,
+        ).toBe(
+          'create_broadcast_with_recipients',
+        );
+
+        expect(
+          calls.usedDirectInsert,
+        ).toBe(0);
+
+        expect(
+          plan.broadcastId,
+        ).toBe('b-1');
+
+        expect(
+          plan.planned,
+        ).toEqual([
+          {
+            recipientRowId:
+              'r-1',
+
+            contactId:
+              'c1',
+
+            phone:
+              '14155550123',
+
+            params: [],
+          },
+        ]);
+
+        expect(
+          plan.whatsappConfigId,
+        ).toBe(
+          WHATSAPP_CONFIG_ID,
+        );
+      },
     );
 
-    expect(
-      calls.rpc,
-    ).toHaveLength(1);
+    it(
+      'passes frozen template params to the atomic RPC',
+      async () => {
+        const {
+          db,
+          calls,
+        } = makeDb({
+          data: [
+            {
+              broadcast_id:
+                'b-1',
 
-    expect(
-      calls.usedDirectInsert,
-    ).toBe(0);
-  });
-});
+              recipient_id:
+                'r-1',
+
+              contact_id:
+                'c1',
+            },
+          ],
+
+          error:
+            null,
+        });
+
+        await createBroadcast(
+          db,
+          'acc',
+          'user',
+          {
+            whatsappConfigId:
+              WHATSAPP_CONFIG_ID,
+
+            templateName:
+              'promo',
+
+            recipients: [
+              {
+                to:
+                  '+14155550123',
+
+                params: [
+                  'Maria',
+                  'R$ 100,00',
+                ],
+              },
+            ],
+          },
+        );
+
+        expect(
+          calls.rpc,
+        ).toHaveLength(
+          1,
+        );
+
+        const args =
+          calls.rpc[0]
+            .args as Record<
+            string,
+            unknown
+          >;
+
+        expect(
+          args.p_template_params,
+        ).toEqual([
+          [
+            'Maria',
+            'R$ 100,00',
+          ],
+        ]);
+
+        expect(
+          args.p_contact_ids,
+        ).toEqual([
+          'c1',
+        ]);
+
+        expect(
+          args.p_whatsapp_config_id,
+        ).toBe(
+          WHATSAPP_CONFIG_ID,
+        );
+      },
+    );
+
+    it(
+      'throws and leaves no orphaned parent when the atomic create fails',
+      async () => {
+        const {
+          db,
+          calls,
+        } = makeDb({
+          data:
+            null,
+
+          error: {
+            message:
+              'recipient insert failed',
+          },
+        });
+
+        await expect(
+          createBroadcast(
+            db,
+            'acc',
+            'user',
+            {
+              whatsappConfigId:
+                WHATSAPP_CONFIG_ID,
+
+              templateName:
+                'promo',
+
+              recipients: [
+                {
+                  to:
+                    '+14155550123',
+                },
+              ],
+            },
+          ),
+        ).rejects.toBeInstanceOf(
+          BroadcastError,
+        );
+
+        expect(
+          calls.rpc,
+        ).toHaveLength(
+          1,
+        );
+
+        expect(
+          calls.usedDirectInsert,
+        ).toBe(0);
+      },
+    );
+  },
+);
 
 // ============================================================
-// Broadcast delivery
-//
-// Meta accepts the message
-//        ↓
-// resolve the EXISTING conversation
-//        ↓
-// insert messages using that conversation_id
-//
-// The broadcast must NOT create a second conversation.
+// DELIVERY TYPES
 // ============================================================
 
 interface DeliveryWrites {
-  recipientUpdate?: Record<string, unknown>;
-  messageInsert?: Record<string, unknown>;
-  conversationUpdate?: Record<string, unknown>;
+  recipientUpdate?:
+    Record<
+      string,
+      unknown
+    >;
+
+  messageInsert?:
+    Record<
+      string,
+      unknown
+    >;
+
+  conversationUpdate?:
+    Record<
+      string,
+      unknown
+    >;
 }
 
 function mergeWrite(
-  current: Record<string, unknown> | undefined,
-  next: Record<string, unknown>,
-): Record<string, unknown> {
+  current:
+    | Record<
+        string,
+        unknown
+      >
+    | undefined,
+
+  next: Record<
+    string,
+    unknown
+  >,
+): Record<
+  string,
+  unknown
+> {
   return {
     ...(current ?? {}),
     ...next,
   };
 }
 
+// ============================================================
+// DELIVERY MOCK DB
+// ============================================================
+
 function makeDeliveryDb(
   writes: DeliveryWrites,
-  recipientCounts: Record<string, number> = {
+
+  recipientCounts: Record<
+    string,
+    number
+  > = {
     pending: 0,
     failed: 0,
     sent: 1,
   },
+
   totalRecipients = 1,
 ) {
   const database = {
     from(table: string) {
-      // --------------------------------------------------------
-      // Broadcast recipients
-      //
-      // This mock must support BOTH:
-      //
-      // 1. update(...).eq(...)
-      //
-      // 2. select(..., { count: 'exact', head: true })
-      //
-      // The second one is used by finalizeBroadcastStatus().
-      // --------------------------------------------------------
-
       if (
-        table === 'broadcast_recipients'
+        table ===
+        'broadcast_recipients'
       ) {
         let selectedStatus:
           | string
@@ -423,7 +650,10 @@ function makeDeliveryDb(
           unknown
         > = {
           update: (
-            row: Record<string, unknown>,
+            row: Record<
+              string,
+              unknown
+            >,
           ) => {
             writes.recipientUpdate =
               mergeWrite(
@@ -434,16 +664,16 @@ function makeDeliveryDb(
             return chain;
           },
 
-          select: () => {
-            return chain;
-          },
+          select: () =>
+            chain,
 
           eq: (
             column: string,
             value: unknown,
           ) => {
             if (
-              column === 'status'
+              column ===
+              'status'
             ) {
               selectedStatus =
                 value as string;
@@ -455,13 +685,17 @@ function makeDeliveryDb(
           then: (
             resolve: (
               result: {
-                count: number;
-                error: null;
-              }
+                count:
+                  number;
+
+                error:
+                  null;
+              },
             ) => unknown,
           ) => {
             const count =
-              selectedStatus === null
+              selectedStatus ===
+              null
                 ? totalRecipients
                 : (
                     recipientCounts[
@@ -471,7 +705,9 @@ function makeDeliveryDb(
 
             return resolve({
               count,
-              error: null,
+
+              error:
+                null,
             });
           },
         };
@@ -479,17 +715,34 @@ function makeDeliveryDb(
         return chain;
       }
 
-      // --------------------------------------------------------
-      // Messages
-      // --------------------------------------------------------
-
-      if (table === 'messages') {
+      if (
+        table ===
+        'messages'
+      ) {
         const chain: Record<
           string,
           unknown
         > = {
+          select: () =>
+            chain,
+
+          eq: () =>
+            chain,
+
+          maybeSingle: () =>
+            Promise.resolve({
+              data:
+                null,
+
+              error:
+                null,
+            }),
+
           insert: (
-            row: Record<string, unknown>,
+            row: Record<
+              string,
+              unknown
+            >,
           ) => {
             writes.messageInsert =
               mergeWrite(
@@ -497,27 +750,37 @@ function makeDeliveryDb(
                 row,
               );
 
-            return Promise.resolve({
-              data: null,
-              error: null,
-            });
+            return chain;
           },
+
+          single: () =>
+            Promise.resolve({
+              data: {
+                id:
+                  'message-row-1',
+              },
+
+              error:
+                null,
+            }),
         };
 
         return chain;
       }
 
-      // --------------------------------------------------------
-      // Conversations
-      // --------------------------------------------------------
-
-      if (table === 'conversations') {
+      if (
+        table ===
+        'conversations'
+      ) {
         const chain: Record<
           string,
           unknown
         > = {
           update: (
-            row: Record<string, unknown>,
+            row: Record<
+              string,
+              unknown
+            >,
           ) => {
             writes.conversationUpdate =
               mergeWrite(
@@ -528,33 +791,34 @@ function makeDeliveryDb(
             return chain;
           },
 
-          eq: () => chain,
-        };
-
-        return chain;
-      }
-
-      // --------------------------------------------------------
-      // Broadcast
-      //
-      // finalizeBroadcastStatus writes only the terminal status.
-      // --------------------------------------------------------
-
-      if (table === 'broadcasts') {
-        const chain: Record<
-          string,
-          unknown
-        > = {
-          update: () => chain,
-
-          eq: () => chain,
+          eq: () =>
+            chain,
         };
 
         return chain;
       }
 
       if (
-        table === 'whatsapp_config'
+        table ===
+        'broadcasts'
+      ) {
+        const chain: Record<
+          string,
+          unknown
+        > = {
+          update: () =>
+            chain,
+
+          eq: () =>
+            chain,
+        };
+
+        return chain;
+      }
+
+      if (
+        table ===
+        'whatsapp_config'
       ) {
         throw new Error(
           'unexpected whatsapp_config access during delivery',
@@ -570,6 +834,10 @@ function makeDeliveryDb(
   return database;
 }
 
+// ============================================================
+// DELIVERY TESTS
+// ============================================================
+
 describe(
   'deliverBroadcast conversation persistence',
   () => {
@@ -580,7 +848,9 @@ describe(
     it(
       'persists the successful broadcast message in the canonical conversation',
       async () => {
-        const writes: DeliveryWrites = {};
+        const writes:
+          DeliveryWrites =
+          {};
 
         const deliveryDb =
           makeDeliveryDb(
@@ -588,32 +858,58 @@ describe(
           );
 
         const plan = {
-          broadcastId: 'b-1',
-          accountId: 'acc',
-          auditUserId: 'user',
+          broadcastId:
+            'b-1',
 
-          templateName: 'promo',
+          accountId:
+            'acc',
+
+          auditUserId:
+            'user',
+
+          whatsappConfigId:
+            WHATSAPP_CONFIG_ID,
+
+          templateName:
+            'promo',
+
           templateLanguage:
             'en_US',
 
-          phoneNumberId: 'pn-1',
+          phoneNumberId:
+            'pn-1',
+
           accessToken:
             'plain-access-token',
 
           templateRow: {
-            id: 'template-1',
-            account_id: 'acc',
-            name: 'promo',
-            language: 'en_US',
+            id:
+              'template-1',
+
+            account_id:
+              'acc',
+
+            name:
+              'promo',
+
+            language:
+              'en_US',
+
             body_text:
               'Olá {{1}}, sua oferta é {{2}}.',
           } as any,
 
           planned: [
             {
-              recipientRowId: 'r-1',
-              contactId: 'c1',
-              phone: '14155550123',
+              recipientRowId:
+                'r-1',
+
+              contactId:
+                'c1',
+
+              phone:
+                '14155550123',
+
               params: [
                 'Maria',
                 'R$ 100,00',
@@ -621,7 +917,8 @@ describe(
             },
           ],
 
-          rejected: 0,
+          rejected:
+            0,
         };
 
         await deliverBroadcast(
@@ -632,12 +929,14 @@ describe(
         expect(
           writes.recipientUpdate,
         ).toMatchObject({
-          status: 'sent',
+          status:
+            'sent',
 
           whatsapp_message_id:
             'wamid-test-1',
 
-          error_message: null,
+          error_message:
+            null,
 
           message_text:
             'Olá Maria, sua oferta é R$ 100,00.',
@@ -649,9 +948,11 @@ describe(
           conversation_id:
             'conv-1',
 
-          sender_type: 'agent',
+          sender_type:
+            'agent',
 
-          sender_id: 'user',
+          sender_id:
+            'user',
 
           content_type:
             'template',
@@ -665,7 +966,8 @@ describe(
           message_id:
             'wamid-test-1',
 
-          status: 'sent',
+          status:
+            'sent',
         });
 
         expect(
@@ -680,7 +982,9 @@ describe(
     it(
       'resolves the conversation by phone before inserting the message',
       async () => {
-        const writes: DeliveryWrites = {};
+        const writes:
+          DeliveryWrites =
+          {};
 
         const deliveryDb =
           makeDeliveryDb(
@@ -689,9 +993,10 @@ describe(
 
         const {
           resolveConversationByPhone,
-        } = await import(
-          '@/lib/whatsapp/resolve-conversation'
-        );
+        } =
+          await import(
+            '@/lib/whatsapp/resolve-conversation'
+          );
 
         const resolver =
           vi.mocked(
@@ -710,31 +1015,55 @@ describe(
         });
 
         const plan = {
-          broadcastId: 'b-2',
-          accountId: 'acc',
-          auditUserId: 'user',
+          broadcastId:
+            'b-2',
 
-          templateName: 'promo',
+          accountId:
+            'acc',
+
+          auditUserId:
+            'user',
+
+          whatsappConfigId:
+            WHATSAPP_CONFIG_ID,
+
+          templateName:
+            'promo',
+
           templateLanguage:
             'en_US',
 
-          phoneNumberId: 'pn-1',
+          phoneNumberId:
+            'pn-1',
+
           accessToken:
             'plain-access-token',
 
           templateRow: {
-            id: 'template-1',
-            account_id: 'acc',
-            name: 'promo',
-            language: 'en_US',
+            id:
+              'template-1',
+
+            account_id:
+              'acc',
+
+            name:
+              'promo',
+
+            language:
+              'en_US',
+
             body_text:
               'Promo para {{1}}',
           } as any,
 
           planned: [
             {
-              recipientRowId: 'r-2',
-              contactId: 'existing-contact',
+              recipientRowId:
+                'r-2',
+
+              contactId:
+                'existing-contact',
+
               phone:
                 '5511999999999',
 
@@ -744,7 +1073,8 @@ describe(
             },
           ],
 
-          rejected: 0,
+          rejected:
+            0,
         };
 
         await deliverBroadcast(
@@ -757,6 +1087,7 @@ describe(
         ).toHaveBeenCalledWith(
           deliveryDb,
           'acc',
+          WHATSAPP_CONFIG_ID,
           '5511999999999',
         );
 
@@ -775,14 +1106,12 @@ describe(
     it(
       'does not mark the recipient failed when local message persistence fails after Meta accepted the message',
       async () => {
-        const writes: DeliveryWrites = {};
+        const writes:
+          DeliveryWrites =
+          {};
 
         const database = {
           from(table: string) {
-            // --------------------------------------------------
-            // Broadcast recipients
-            // --------------------------------------------------
-
             if (
               table ===
               'broadcast_recipients'
@@ -831,18 +1160,26 @@ describe(
                 then: (
                   resolve: (
                     result: {
-                      count: number;
-                      error: null;
-                    }
+                      count:
+                        number;
+
+                      error:
+                        null;
+                    },
                   ) => unknown,
                 ) => {
                   const counts: Record<
                     string,
                     number
                   > = {
-                    pending: 0,
-                    failed: 0,
-                    sent: 1,
+                    pending:
+                      0,
+
+                    failed:
+                      0,
+
+                    sent:
+                      1,
                   };
 
                   const count =
@@ -857,7 +1194,9 @@ describe(
 
                   return resolve({
                     count,
-                    error: null,
+
+                    error:
+                      null,
                   });
                 },
               };
@@ -865,31 +1204,66 @@ describe(
               return chain;
             }
 
-            // --------------------------------------------------
-            // Messages
-            //
-            // Meta accepted the message,
-            // but local persistence fails.
-            // --------------------------------------------------
-
             if (
-              table === 'messages'
+              table ===
+              'messages'
             ) {
-              return {
-                insert: () =>
+              const insertChain: Record<
+                string,
+                unknown
+              > = {
+                select: () =>
+                  insertChain,
+
+                single: () =>
                   Promise.resolve({
-                    data: null,
+                    data:
+                      null,
+
                     error: {
                       message:
                         'messages insert failed',
                     },
                   }),
               };
-            }
 
-            // --------------------------------------------------
-            // Conversations
-            // --------------------------------------------------
+              const chain: Record<
+                string,
+                unknown
+              > = {
+                select: () =>
+                  chain,
+
+                eq: () =>
+                  chain,
+
+                maybeSingle: () =>
+                  Promise.resolve({
+                    data:
+                      null,
+
+                    error:
+                      null,
+                  }),
+
+                insert: (
+                  row: Record<
+                    string,
+                    unknown
+                  >,
+                ) => {
+                  writes.messageInsert =
+                    mergeWrite(
+                      writes.messageInsert,
+                      row,
+                    );
+
+                  return insertChain;
+                },
+              };
+
+              return chain;
+            }
 
             if (
               table ===
@@ -921,12 +1295,9 @@ describe(
               return chain;
             }
 
-            // --------------------------------------------------
-            // Broadcast
-            // --------------------------------------------------
-
             if (
-              table === 'broadcasts'
+              table ===
+              'broadcasts'
             ) {
               const chain: Record<
                 string,
@@ -949,31 +1320,55 @@ describe(
         } as unknown as SupabaseClient;
 
         const plan = {
-          broadcastId: 'b-3',
-          accountId: 'acc',
-          auditUserId: 'user',
+          broadcastId:
+            'b-3',
 
-          templateName: 'promo',
+          accountId:
+            'acc',
+
+          auditUserId:
+            'user',
+
+          whatsappConfigId:
+            WHATSAPP_CONFIG_ID,
+
+          templateName:
+            'promo',
+
           templateLanguage:
             'en_US',
 
-          phoneNumberId: 'pn-1',
+          phoneNumberId:
+            'pn-1',
+
           accessToken:
             'plain-access-token',
 
           templateRow: {
-            id: 'template-1',
-            account_id: 'acc',
-            name: 'promo',
-            language: 'en_US',
+            id:
+              'template-1',
+
+            account_id:
+              'acc',
+
+            name:
+              'promo',
+
+            language:
+              'en_US',
+
             body_text:
               'Promo {{1}}',
           } as any,
 
           planned: [
             {
-              recipientRowId: 'r-3',
-              contactId: 'c1',
+              recipientRowId:
+                'r-3',
+
+              contactId:
+                'c1',
+
               phone:
                 '14155550123',
 
@@ -983,7 +1378,8 @@ describe(
             },
           ],
 
-          rejected: 0,
+          rejected:
+            0,
         };
 
         await deliverBroadcast(
@@ -991,14 +1387,11 @@ describe(
           plan,
         );
 
-        // Meta accepted the message.
-        // Therefore the recipient MUST remain "sent"
-        // even if local message persistence fails.
-
         expect(
           writes.recipientUpdate,
         ).toMatchObject({
-          status: 'sent',
+          status:
+            'sent',
 
           whatsapp_message_id:
             'wamid-test-1',
@@ -1006,24 +1399,32 @@ describe(
 
         expect(
           writes.recipientUpdate?.status,
-        ).not.toBe('failed');
+        ).not.toBe(
+          'failed',
+        );
       },
     );
   },
 );
 
 // ============================================================
-// Terminal status (#472)
-//
-// Derived from recipient rows, not from a local counter belonging
-// to one delivery pass.
+// FINALIZE MOCK
 // ============================================================
 
 function statusDb(
-  counts: Record<string, number>,
+  counts: Record<
+    string,
+    number
+  >,
+
   total: number,
+
   writes: {
-    update?: Record<string, unknown>;
+    update?:
+      Record<
+        string,
+        unknown
+      >;
   },
 ) {
   return {
@@ -1036,14 +1437,16 @@ function statusDb(
         string,
         unknown
       > = {
-        select: () => b,
+        select: () =>
+          b,
 
         eq: (
           col: string,
           val: unknown,
         ) => {
           if (
-            col === 'status'
+            col ===
+            'status'
           ) {
             status =
               val as string;
@@ -1072,14 +1475,18 @@ function statusDb(
         then: (
           resolve: (
             result: {
-              count: number;
-              error: null;
-            }
+              count:
+                number;
+
+              error:
+                null;
+            },
           ) => unknown,
         ) =>
           resolve({
             count:
-              status === null
+              status ===
+              null
                 ? total
                 : (
                     counts[
@@ -1087,7 +1494,8 @@ function statusDb(
                     ] ?? 0
                   ),
 
-            error: null,
+            error:
+              null,
           }),
       };
 
@@ -1096,6 +1504,10 @@ function statusDb(
   } as unknown as SupabaseClient;
 }
 
+// ============================================================
+// FINALIZE TESTS
+// ============================================================
+
 describe(
   'finalizeBroadcastStatus',
   () => {
@@ -1103,20 +1515,25 @@ describe(
       'leaves a capped pass in "sending" while recipients are still pending',
       async () => {
         const writes: {
-          update?: Record<
-            string,
-            unknown
-          >;
+          update?:
+            Record<
+              string,
+              unknown
+            >;
         } = {};
 
         await finalizeBroadcastStatus(
           statusDb(
             {
-              pending: 25,
+              pending:
+                25,
             },
+
             1025,
+
             writes,
           ),
+
           'b-1',
         );
 
@@ -1130,21 +1547,28 @@ describe(
       'marks a fully-failed broadcast failed',
       async () => {
         const writes: {
-          update?: Record<
-            string,
-            unknown
-          >;
+          update?:
+            Record<
+              string,
+              unknown
+            >;
         } = {};
 
         await finalizeBroadcastStatus(
           statusDb(
             {
-              pending: 0,
-              failed: 10,
+              pending:
+                0,
+
+              failed:
+                10,
             },
+
             10,
+
             writes,
           ),
+
           'b-1',
         );
 
@@ -1160,21 +1584,28 @@ describe(
       'marks a partially-failed broadcast sent',
       async () => {
         const writes: {
-          update?: Record<
-            string,
-            unknown
-          >;
+          update?:
+            Record<
+              string,
+              unknown
+            >;
         } = {};
 
         await finalizeBroadcastStatus(
           statusDb(
             {
-              pending: 0,
-              failed: 3,
+              pending:
+                0,
+
+              failed:
+                3,
             },
+
             10,
+
             writes,
           ),
+
           'b-1',
         );
 
@@ -1190,33 +1621,28 @@ describe(
       'does not condemn a campaign whose resume pass sent nothing new',
       async () => {
         const writes: {
-          update?: Record<
-            string,
-            unknown
-          >;
+          update?:
+            Record<
+              string,
+              unknown
+            >;
         } = {};
-
-        // 800 were already delivered.
-        // The resume pass contains the remaining
-        // 200 and all 200 fail.
-        //
-        // Aggregate:
-        //
-        // total  = 1000
-        // failed = 200
-        // sent   = 800
-        //
-        // Therefore the broadcast is "sent".
 
         await finalizeBroadcastStatus(
           statusDb(
             {
-              pending: 0,
-              failed: 200,
+              pending:
+                0,
+
+              failed:
+                200,
             },
+
             1000,
+
             writes,
           ),
+
           'b-1',
         );
 

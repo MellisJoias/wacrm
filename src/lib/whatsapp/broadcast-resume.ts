@@ -49,25 +49,6 @@ export const RESUME_SCOPES: readonly ResumeScope[] = [
 // ============================================================
 // Limits
 // ============================================================
-//
-// Cada execução processa no máximo 12 destinatários.
-//
-// Isso é necessário porque o delivery é sequencial e existe
-// um intervalo aleatório de 10–20 segundos entre destinatários.
-//
-// Exemplo:
-//
-// 55 pending:
-//
-// PASS 1 -> 12
-// PASS 2 -> 12
-// PASS 3 -> 12
-// PASS 4 -> 12
-// PASS 5 -> 7
-//
-// Variantes do mesmo telefone NÃO consomem esse intervalo.
-//
-// ============================================================
 
 export const RESUME_MAX_PER_REQUEST = 12;
 
@@ -309,7 +290,7 @@ export async function planBroadcastResume(
   } = await db
     .from('broadcasts')
     .select(
-      'id, template_name, template_language, header_media_url',
+      'id, whatsapp_config_id, template_name, template_language, header_media_url',
     )
     .eq(
       'id',
@@ -331,6 +312,19 @@ export async function planBroadcastResume(
       404,
     );
   }
+
+  if (
+    !broadcast.whatsapp_config_id
+  ) {
+    throw new BroadcastError(
+      'whatsapp_not_configured',
+      'This broadcast is not associated with a WhatsApp configuration.',
+      400,
+    );
+  }
+
+  const whatsappConfigId =
+    broadcast.whatsapp_config_id;
 
   // ----------------------------------------------------------
   // Recipients
@@ -434,15 +428,6 @@ export async function planBroadcastResume(
   // ----------------------------------------------------------
   // PASS LIMIT
   // ----------------------------------------------------------
-  //
-  // IMPORTANTE:
-  //
-  // Cada execução pega no máximo 12 destinatários.
-  //
-  // Isso permite que a execução termine antes do limite
-  // de 300 segundos da Vercel.
-  //
-  // ----------------------------------------------------------
 
   const slice =
     sendable.slice(
@@ -484,10 +469,14 @@ export async function planBroadcastResume(
     .from('whatsapp_config')
     .select('*')
     .eq(
+      'id',
+      whatsappConfigId,
+    )
+    .eq(
       'account_id',
       accountId,
     )
-    .single();
+    .maybeSingle();
 
   if (
     configError ||
@@ -495,7 +484,7 @@ export async function planBroadcastResume(
   ) {
     throw new BroadcastError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'WhatsApp configuration for this broadcast was not found.',
       400,
     );
   }
@@ -508,6 +497,7 @@ export async function planBroadcastResume(
     await resolveTemplateRow(
       db,
       accountId,
+      whatsappConfigId,
       broadcast.template_name,
       broadcast.template_language,
     );
@@ -530,6 +520,8 @@ export async function planBroadcastResume(
     broadcastId,
 
     accountId,
+
+    whatsappConfigId,
 
     auditUserId,
 

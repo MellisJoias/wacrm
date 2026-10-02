@@ -29,6 +29,8 @@ interface OverviewCounts {
 interface WhatsAppStatus {
   configured: boolean;
   connected: boolean;
+  total: number;
+  connectedCount: number;
 }
 
 export function SettingsOverview({
@@ -36,8 +38,15 @@ export function SettingsOverview({
 }: {
   onSelect: (section: SettingsSection) => void;
 }) {
-  const { user, profile, accountId, accountRole, defaultCurrency, canManageMembers } =
-    useAuth();
+  const {
+    user,
+    profile,
+    accountId,
+    accountRole,
+    defaultCurrency,
+    canManageMembers,
+  } = useAuth();
+
   const { mode, theme } = useTheme();
   const t = useTranslations('Settings.overview');
   const tRoles = useTranslations('Settings.roles');
@@ -45,53 +54,80 @@ export function SettingsOverview({
 
   const [counts, setCounts] = useState<OverviewCounts | null>(null);
   const [countsLoading, setCountsLoading] = useState(true);
-  // WhatsApp status is tracked separately: its health check decrypts the
-  // token and pings Meta, which is far slower than the cheap count
-  // queries. Gating it independently keeps a slow/flaky Meta round-trip
-  // from blanking the rest of the landing.
+
   const [whatsapp, setWhatsapp] = useState<WhatsAppStatus | null>(null);
   const [whatsappLoading, setWhatsappLoading] = useState(true);
 
   useEffect(() => {
     if (!user || !accountId) return;
+
     let cancelled = false;
     const supabase = createClient();
     const userId = user.id;
-    const acctId = accountId;
 
     // Cheap counts — resolve fast, render immediately.
     (async () => {
       setCountsLoading(true);
-      const [membersRes, invitesRes, templatesTotal, templatesPending, tagsRes, fieldsRes] =
-        await Promise.allSettled([
-          fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
-          canManageMembers
-            ? fetch('/api/account/invitations', { cache: 'no-store' }).then((r) =>
-                r.json(),
-              )
-            : Promise.resolve(null),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId)
-            .eq('status', 'PENDING'),
-          supabase
-            .from('tags')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase.from('custom_fields').select('id', { count: 'exact', head: true }),
-        ]);
+
+      const [
+        membersRes,
+        invitesRes,
+        templatesTotal,
+        templatesPending,
+        tagsRes,
+        fieldsRes,
+      ] = await Promise.allSettled([
+        fetch('/api/account/members', {
+          cache: 'no-store',
+        }).then((r) => r.json()),
+
+        canManageMembers
+          ? fetch('/api/account/invitations', {
+              cache: 'no-store',
+            }).then((r) => r.json())
+          : Promise.resolve(null),
+
+        supabase
+          .from('message_templates')
+          .select('id', {
+            count: 'exact',
+            head: true,
+          })
+          .eq('user_id', userId),
+
+        supabase
+          .from('message_templates')
+          .select('id', {
+            count: 'exact',
+            head: true,
+          })
+          .eq('user_id', userId)
+          .eq('status', 'PENDING'),
+
+        supabase
+          .from('tags')
+          .select('id', {
+            count: 'exact',
+            head: true,
+          })
+          .eq('user_id', userId),
+
+        supabase
+          .from('custom_fields')
+          .select('id', {
+            count: 'exact',
+            head: true,
+          }),
+      ]);
 
       if (cancelled) return;
 
       const members =
-        membersRes.status === 'fulfilled' && Array.isArray(membersRes.value?.members)
+        membersRes.status === 'fulfilled' &&
+        Array.isArray(membersRes.value?.members)
           ? membersRes.value.members.length
           : null;
+
       const pendingInvites =
         invitesRes.status === 'fulfilled' &&
         invitesRes.value &&
@@ -106,34 +142,104 @@ export function SettingsOverview({
           templatesTotal.status === 'fulfilled'
             ? templatesTotal.value.count ?? null
             : null,
+
         templatesPending:
           templatesPending.status === 'fulfilled'
             ? templatesPending.value.count ?? null
             : null,
-        tags: tagsRes.status === 'fulfilled' ? tagsRes.value.count ?? null : null,
+
+        tags:
+          tagsRes.status === 'fulfilled'
+            ? tagsRes.value.count ?? null
+            : null,
+
         customFields:
-          fieldsRes.status === 'fulfilled' ? fieldsRes.value.count ?? null : null,
+          fieldsRes.status === 'fulfilled'
+            ? fieldsRes.value.count ?? null
+            : null,
       });
+
       setCountsLoading(false);
     })();
 
-    // WhatsApp connection status — slower, independent.
+    // WhatsApp connection status.
+    //
+    // Do not query whatsapp_config directly with maybeSingle():
+    // an account can now have multiple WhatsApp configurations.
+    // The API already knows how to return the appropriate
+    // multi-config response.
     (async () => {
       setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
-        supabase
-          .from('whatsapp_config')
-          .select('phone_number_id')
-          .eq('account_id', acctId)
-          .maybeSingle(),
-        fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
-      ]);
-      if (cancelled) return;
-      setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
-        connected: health.status === 'fulfilled' && !!health.value?.connected,
-      });
-      setWhatsappLoading(false);
+
+      try {
+        const response = await fetch('/api/whatsapp/config', {
+          cache: 'no-store',
+        });
+
+        if (!response.ok) {
+          if (!cancelled) {
+            setWhatsapp({
+              configured: false,
+              connected: false,
+              total: 0,
+              connectedCount: 0,
+            });
+            setWhatsappLoading(false);
+          }
+          return;
+        }
+
+        const data = await response.json();
+
+        if (cancelled) return;
+
+        // Multiple-config response.
+        if (Array.isArray(data?.configs)) {
+          const configs = data.configs;
+
+          const total = configs.length;
+          const connectedCount = configs.filter(
+            (config: { connected?: boolean; status?: string }) =>
+              config.connected === true || config.status === 'connected',
+          ).length;
+
+          setWhatsapp({
+            configured: total > 0,
+            connected: total > 0 && connectedCount === total,
+            total,
+            connectedCount,
+          });
+        } else {
+          // Backward-compatible single-config response.
+          const configured =
+            Boolean(data?.phone_number_id) ||
+            Boolean(data?.config?.phone_number_id);
+
+          const connected = Boolean(data?.connected);
+
+          setWhatsapp({
+            configured,
+            connected,
+            total: configured ? 1 : 0,
+            connectedCount: connected ? 1 : 0,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setWhatsapp({
+            configured: false,
+            connected: false,
+            total: 0,
+            connectedCount: 0,
+          });
+          setWhatsappLoading(false);
+        }
+        return;
+      }
+
+      if (!cancelled) {
+        setWhatsappLoading(false);
+      }
     })();
 
     return () => {
@@ -141,18 +247,65 @@ export function SettingsOverview({
     };
   }, [user?.id, accountId, canManageMembers]);
 
-  const displayName = profile?.full_name || profile?.email || t('yourAccount');
-  const initial = (profile?.full_name || profile?.email || 'U').charAt(0).toUpperCase();
+  const displayName =
+    profile?.full_name || profile?.email || t('yourAccount');
+
+  const initial = (
+    profile?.full_name ||
+    profile?.email ||
+    'U'
+  )
+    .charAt(0)
+    .toUpperCase();
+
   const roleMeta = accountRole ? ROLE_META[accountRole] : null;
   const RoleIcon = roleMeta?.icon;
 
   const currencyLabel =
-    CURRENCIES.find((c) => c.code === defaultCurrency)?.label ?? defaultCurrency;
-  const themeName = THEMES.find((t) => t.id === theme)?.name ?? theme;
-  const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    CURRENCIES.find((c) => c.code === defaultCurrency)?.label ??
+    defaultCurrency;
 
-  // Per-tile loading + subtitle. `null` counts render as a graceful
-  // fallback so a single failed query never blanks a tile.
+  const themeName =
+    THEMES.find((t) => t.id === theme)?.name ?? theme;
+
+  const cap = (s: string) =>
+    s.charAt(0).toUpperCase() + s.slice(1);
+
+  const whatsappSubtitle = (() => {
+    if (!whatsapp?.configured) {
+      return t('notSetup');
+    }
+
+    if (whatsapp.total === 1) {
+      return whatsapp.connected ? (
+        <>
+          <StatusDot tone="ok" /> {t('connected')}
+        </>
+      ) : (
+        <>
+          <StatusDot tone="muted" /> {t('needsReconnecting')}
+        </>
+      );
+    }
+
+    if (whatsapp.connectedCount === whatsapp.total) {
+      return (
+        <>
+          <StatusDot tone="ok" /> {whatsapp.connectedCount} WhatsApp
+          {whatsapp.connectedCount === 1 ? '' : 's'} conectado
+          {whatsapp.connectedCount === 1 ? '' : 's'}
+        </>
+      );
+    }
+
+    return (
+      <>
+        <StatusDot tone="muted" /> {whatsapp.connectedCount}/
+        {whatsapp.total} WhatsApp conectados
+      </>
+    );
+  })();
+
   const tiles: {
     section: SettingsSection;
     loading: boolean;
@@ -161,61 +314,69 @@ export function SettingsOverview({
     {
       section: 'whatsapp',
       loading: whatsappLoading,
-      subtitle: !whatsapp?.configured ? (
-        t('notSetup')
-      ) : whatsapp.connected ? (
-        <>
-          <StatusDot tone="ok" /> {t('connected')}
-        </>
-      ) : (
-        <>
-          <StatusDot tone="muted" /> {t('needsReconnecting')}
-        </>
-      ),
+      subtitle: whatsappSubtitle,
     },
+
     {
       section: 'members',
       loading: countsLoading,
       subtitle:
         counts?.members == null
           ? t('viewTeamMembers')
-          : `${t('membersCount', { count: counts.members })}${
+          : `${t('membersCount', {
+              count: counts.members,
+            })}${
               counts.pendingInvites
-                ? ` · ${t('pendingInvites', { count: counts.pendingInvites })}`
+                ? ` · ${t('pendingInvites', {
+                    count: counts.pendingInvites,
+                  })}`
                 : ''
             }`,
     },
+
     {
       section: 'templates',
       loading: countsLoading,
       subtitle:
         counts?.templates == null
           ? t('manageTemplates')
-          : `${t('templatesCount', { count: counts.templates })}${
+          : `${t('templatesCount', {
+              count: counts.templates,
+            })}${
               counts.templatesPending
-                ? ` · ${t('pendingReview', { count: counts.templatesPending })}`
+                ? ` · ${t('pendingReview', {
+                    count: counts.templatesPending,
+                  })}`
                 : ''
             }`,
     },
+
     {
       section: 'deals',
       loading: false,
       subtitle: `${defaultCurrency} — ${currencyLabel}`,
     },
+
     {
       section: 'fields',
       loading: countsLoading,
       subtitle:
         counts?.tags == null && counts?.customFields == null
           ? t('tagsAndFields')
-          : `${t('tagsCount', { count: counts?.tags ?? 0 })} · ${t('fieldsCount', {
+          : `${t('tagsCount', {
+              count: counts?.tags ?? 0,
+            })} · ${t('fieldsCount', {
               count: counts?.customFields ?? 0,
             })}`,
     },
+
     {
       section: 'appearance',
       loading: false,
-      subtitle: t('appearance', { mode: cap(mode), theme: themeName }),
+      subtitle: t('appearance', {
+        mode: cap(mode),
+        theme: themeName,
+      }),
     },
   ];
 
@@ -225,22 +386,29 @@ export function SettingsOverview({
       <Card className="flex-row items-center gap-4 px-5 py-5">
         <Avatar size="lg" className="size-14">
           {profile?.avatar_url ? (
-            <AvatarImage src={profile.avatar_url} alt={displayName} />
+            <AvatarImage
+              src={profile.avatar_url}
+              alt={displayName}
+            />
           ) : null}
+
           <AvatarFallback className="bg-primary/10 text-xl text-primary">
             {initial}
           </AvatarFallback>
         </Avatar>
+
         <div className="min-w-0 flex-1">
           <div className="truncate text-base font-semibold text-foreground">
             {displayName}
           </div>
+
           {profile?.email ? (
             <div className="truncate text-sm text-muted-foreground">
               {profile.email}
             </div>
           ) : null}
         </div>
+
         {roleMeta && RoleIcon ? (
           <SettingsChip variant={roleMeta.variant}>
             <RoleIcon />
@@ -254,6 +422,7 @@ export function SettingsOverview({
         {tiles.map(({ section, loading, subtitle }) => {
           const meta = SECTION_META[section];
           const Icon = meta.icon;
+
           return (
             <button
               key={section}
@@ -267,20 +436,24 @@ export function SettingsOverview({
               <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary-soft text-primary">
                 <Icon className="size-4" />
               </span>
+
               <span className="min-w-0 flex-1">
                 <span className="block text-sm font-semibold text-foreground">
                   {tSections(section)}
                 </span>
+
                 <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
                   {loading ? (
                     <>
-                      <Loader2 className="size-3 animate-spin" /> {t('loading')}
+                      <Loader2 className="size-3 animate-spin" />
+                      {t('loading')}
                     </>
                   ) : (
                     subtitle
                   )}
                 </span>
               </span>
+
               <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
             </button>
           );

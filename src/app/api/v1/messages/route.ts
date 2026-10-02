@@ -13,17 +13,18 @@
 // Body:
 //   {
 //     "to": "+14155550123",                 // required, E.164
-//     "type": "text",                        // text|template|image|video|document|audio (default: text)
-//     "text": "Hello!",                      // text body, or media caption
-//     "media_url": "https://…/file.pdf",     // required for image/video/document/audio
-//     "filename": "invoice.pdf",             // optional, document filename
-//     "template": {                          // required when type=template
+//     "whatsapp_config_id": "<uuid>",       // required, WhatsApp channel/config
+//     "type": "text",                       // text|template|image|video|document|audio (default: text)
+//     "text": "Hello!",                     // text body, or media caption
+//     "media_url": "https://…/file.pdf",    // required for image/video/document/audio
+//     "filename": "invoice.pdf",            // optional, document filename
+//     "template": {                         // required when type=template
 //       "name": "order_update",
 //       "language": "en_US",
 //       "params": ["A123"] | { "body": [...] }   // array = positional body; object = structured
 //     },
-//     "reply_to_message_id": "<uuid>",       // optional, must be in the same conversation
-//     "name": "Jane Doe"                     // optional, names a newly-created contact
+//     "reply_to_message_id": "<uuid>",      // optional, must be in the same conversation
+//     "name": "Jane Doe"                    // optional, names a newly-created contact
 //   }
 //
 // Response (201):
@@ -49,6 +50,7 @@ export async function POST(request: Request) {
       string,
       unknown
     > | null;
+
     if (!body || typeof body !== 'object') {
       return fail('bad_request', 'Request body must be a JSON object', 400);
     }
@@ -56,6 +58,19 @@ export async function POST(request: Request) {
     const to = typeof body.to === 'string' ? body.to.trim() : '';
     if (!to) {
       return fail('bad_request', "'to' is required", 400);
+    }
+
+    const whatsappConfigId =
+      typeof body.whatsapp_config_id === 'string'
+        ? body.whatsapp_config_id.trim()
+        : '';
+
+    if (!whatsappConfigId) {
+      return fail(
+        'bad_request',
+        "'whatsapp_config_id' is required",
+        400
+      );
     }
 
     const type = typeof body.type === 'string' ? body.type : 'text';
@@ -67,11 +82,13 @@ export async function POST(request: Request) {
       body.template && typeof body.template === 'object'
         ? (body.template as Record<string, unknown>)
         : null;
+
     const templateParams = Array.isArray(template?.params)
       ? (template.params as unknown[]).filter(
           (p): p is string => typeof p === 'string'
         )
       : undefined;
+
     const templateMessageParams =
       template?.params && !Array.isArray(template.params)
         ? template.params
@@ -95,12 +112,12 @@ export async function POST(request: Request) {
       interactivePayload,
     });
 
-    // Find-or-create the conversation for this phone, then send. Both
-    // steps share `SendMessageError`, so one catch maps the whole
-    // pipeline to the envelope.
+    // Find-or-create the conversation for this phone AND the selected
+    // WhatsApp config, then send through that same channel.
     const resolved = await resolveConversationByPhone(
       ctx.supabase,
       ctx.accountId,
+      whatsappConfigId,
       to,
       typeof body.name === 'string' ? body.name : null
     );
@@ -141,6 +158,7 @@ export async function POST(request: Request) {
     if (err instanceof SendMessageError) {
       return fail(err.code, err.message, err.status);
     }
+
     return toApiErrorResponse(err);
   }
 }

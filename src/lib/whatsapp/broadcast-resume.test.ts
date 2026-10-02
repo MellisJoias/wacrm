@@ -260,13 +260,36 @@ function planDb(
           return b;
         },
 
-        maybeSingle: async () => ({
-          data:
-            fx.broadcast === undefined
-              ? null
-              : fx.broadcast,
-          error: null,
-        }),
+        maybeSingle: async () => {
+          if (
+            table === 'broadcasts'
+          ) {
+            return {
+              data:
+                fx.broadcast === undefined
+                  ? null
+                  : fx.broadcast,
+              error: null,
+            };
+          }
+
+          if (
+            table === 'whatsapp_config'
+          ) {
+            return {
+              data:
+                fx.config === undefined
+                  ? null
+                  : fx.config,
+              error: null,
+            };
+          }
+
+          return {
+            data: null,
+            error: null,
+          };
+        },
 
         single: async () => ({
           data:
@@ -320,11 +343,13 @@ function planDb(
 
 const BROADCAST = {
   id: 'bc-1',
+  whatsapp_config_id: 'wc-1',
   template_name: 'order_update',
   template_language: 'en_US',
 };
 
 const CONFIG = {
+  id: 'wc-1',
   phone_number_id: 'pn-1',
   access_token: 'tok',
 };
@@ -337,6 +362,7 @@ function recipient(
 ) {
   return {
     id,
+    contact_id: contactId,
     template_params: params,
 
     contact: phone

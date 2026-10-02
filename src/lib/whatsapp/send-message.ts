@@ -119,8 +119,13 @@ export function validateSendMessageParams(params: {
   templateName?: string | null;
   interactivePayload?: InteractiveMessagePayload | null;
 }): void {
-  const { messageType, contentText, mediaUrl, templateName, interactivePayload } =
-    params;
+  const {
+    messageType,
+    contentText,
+    mediaUrl,
+    templateName,
+    interactivePayload,
+  } = params;
 
   if (!messageType) {
     throw new SendMessageError('bad_request', 'message_type is required', 400);
@@ -221,7 +226,9 @@ export async function sendMessageToConversation(
 
   const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
 
-  // Conversation + contact, account-scoped.
+  // Conversation + contact + selected WhatsApp configuration,
+  // account-scoped. The conversation's whatsapp_config_id determines
+  // which WhatsApp number must be used for this send.
   const { data: conversation, error: convError } = await db
     .from('conversations')
     .select('*, contact:contacts(*)')
@@ -231,6 +238,14 @@ export async function sendMessageToConversation(
 
   if (convError || !conversation) {
     throw new SendMessageError('not_found', 'Conversation not found', 404);
+  }
+
+  if (!conversation.whatsapp_config_id) {
+    throw new SendMessageError(
+      'whatsapp_not_configured',
+      'WhatsApp channel is not configured for this conversation.',
+      400
+    );
   }
 
   const contact = conversation.contact;
@@ -251,17 +266,20 @@ export async function sendMessageToConversation(
     );
   }
 
-  // WhatsApp config, account-scoped.
+  // WhatsApp config is resolved from the conversation's channel.
+  // Never select a config only by account_id because an account can
+  // now have multiple WhatsApp numbers.
   const { data: config, error: configError } = await db
     .from('whatsapp_config')
     .select('*')
+    .eq('id', conversation.whatsapp_config_id)
     .eq('account_id', accountId)
     .single();
 
   if (configError || !config) {
     throw new SendMessageError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'WhatsApp channel configured for this conversation was not found.',
       400
     );
   }
@@ -316,15 +334,21 @@ export async function sendMessageToConversation(
   // components AND for the body we persist. The lookup tolerates the
   // en / en_US split so a caller that omits the language still resolves
   // a row (see resolveTemplateRow).
+  //
+  // Templates are scoped to the same WhatsApp configuration as the
+  // conversation so templates from another number cannot be mixed in.
   let templateRow: MessageTemplate | null = null;
   let sendLanguage = templateLanguage || 'en_US';
+
   if (messageType === 'template' && templateName) {
     const resolved = await resolveTemplateRow(
       db,
       accountId,
+      conversation.whatsapp_config_id,
       templateName,
       templateLanguage
     );
+
     if (resolved.malformed) {
       throw new SendMessageError(
         'template_malformed',
@@ -332,6 +356,7 @@ export async function sendMessageToConversation(
         500
       );
     }
+
     templateRow = resolved.row;
     sendLanguage = resolved.language;
   }
@@ -351,6 +376,7 @@ export async function sendMessageToConversation(
       });
       return result.messageId;
     }
+
     if (isMediaKind) {
       const result = await sendMediaMessage({
         phoneNumberId: config.phone_number_id,
@@ -364,8 +390,10 @@ export async function sendMessageToConversation(
       });
       return result.messageId;
     }
+
     if (messageType === 'interactive') {
       const p = interactivePayload!;
+
       if (p.kind === 'buttons') {
         const result = await sendInteractiveButtons({
           phoneNumberId: config.phone_number_id,
@@ -379,6 +407,7 @@ export async function sendMessageToConversation(
         });
         return result.messageId;
       }
+
       const result = await sendInteractiveList({
         phoneNumberId: config.phone_number_id,
         accessToken,
@@ -392,6 +421,7 @@ export async function sendMessageToConversation(
       });
       return result.messageId;
     }
+
     const result = await sendTextMessage({
       phoneNumberId: config.phone_number_id,
       accessToken,
@@ -407,6 +437,7 @@ export async function sendMessageToConversation(
   // back to the contact so the next send goes straight through.
   let waMessageId = '';
   let workingPhone = sanitizedPhone;
+
   try {
     const variants = phoneVariants(sanitizedPhone);
     let lastError: unknown = null;
@@ -419,10 +450,13 @@ export async function sendMessageToConversation(
         break;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+
         if (!isRecipientNotAllowedError(message)) {
           throw err;
         }
+
         lastError = err;
+
         console.warn(
           `[send-message] variant "${variant}" rejected by Meta, trying next…`
         );
@@ -433,14 +467,24 @@ export async function sendMessageToConversation(
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
-    console.error('[send-message] Meta send failed for all variants:', message);
-    throw new SendMessageError('meta_error', `Meta API error: ${message}`, 502);
+
+    console.error(
+      '[send-message] Meta send failed for all variants:',
+      message
+    );
+
+    throw new SendMessageError(
+      'meta_error',
+      `Meta API error: ${message}`,
+      502
+    );
   }
 
   if (workingPhone !== sanitizedPhone) {
     console.log(
       `[send-message] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
     );
+
     await db
       .from('contacts')
       .update({ phone: workingPhone })
@@ -487,7 +531,11 @@ export async function sendMessageToConversation(
     .single();
 
   if (msgError) {
-    console.error('[send-message] error inserting sent message:', msgError);
+    console.error(
+      '[send-message] error inserting sent message:',
+      msgError
+    );
+
     throw new SendMessageError(
       'db_error',
       `Message sent to Meta but failed to save to DB: ${msgError.message}`,
@@ -522,8 +570,12 @@ export async function sendMessageToConversation(
       .eq('account_id', accountId)
       .eq('contact_id', contact.id)
       .eq('status', 'active');
+
     if (pauseErr) {
-      console.error('[flows] pause-on-agent-send failed:', pauseErr.message);
+      console.error(
+        '[flows] pause-on-agent-send failed:',
+        pauseErr.message
+      );
     }
   } catch (err) {
     console.error(
@@ -532,5 +584,8 @@ export async function sendMessageToConversation(
     );
   }
 
-  return { messageId: messageRecord.id, whatsappMessageId: waMessageId };
+  return {
+    messageId: messageRecord.id,
+    whatsappMessageId: waMessageId,
+  };
 }

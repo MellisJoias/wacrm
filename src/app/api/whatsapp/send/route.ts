@@ -14,24 +14,20 @@ import {
 
 // The dashboard's outbound-send endpoint. It owns auth, per-user rate
 // limiting, and the two ways the UI targets a thread — an existing
-// `conversation_id` (inbox) or a `contact_id` (Contact detail →
-// find-or-create the conversation). The actual Meta plumbing (validate
-// → send → persist → pause flows) lives in the shared
-// `sendMessageToConversation` core, which the public `/api/v1/messages`
-// endpoint reuses. This route is a thin adapter: resolve the
-// conversation, delegate, then map `SendMessageError` back onto the
-// dashboard's internal `{ error }` shape.
+// `conversation_id` (inbox) or a `contact_id` (Contact detail ->
+// find-or-create the conversation).
+//
+// With multiple WhatsApp numbers, a new conversation created from a
+// contact must explicitly identify the WhatsApp configuration through
+// `whatsapp_config_id`. Existing conversations already carry their
+// channel, so their configured channel is preserved.
+//
+// The actual Meta plumbing (validate -> send -> persist -> pause flows)
+// lives in the shared `sendMessageToConversation` core.
 export async function POST(request: Request) {
   try {
     // Requires the 'agent' role, matching both `canSendMessages` and the
     // `messages_modify` RLS policy (migration 017).
-    //
-    // Resolving `account_id` off the profile — which any 'viewer' has —
-    // was previously the only gate. RLS did block the message INSERT, but
-    // the send core calls Meta BEFORE it persists, so a viewer's request
-    // still delivered a real WhatsApp message to the customer and merely
-    // failed to record it (surfacing as "sent to Meta but failed to save
-    // to DB"). RLS can't un-send that, so the role check belongs here.
     const { supabase, accountId, userId } = await requireRole('agent')
 
     // Per-user rate limit. Bucket key is scoped to this route so
@@ -42,12 +38,19 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
+
     const {
-      // `conversation_id` targets an existing thread (inbox). `contact_id`
-      // lets a caller initiate from a contact that may have no conversation
-      // yet (Contact detail → Send template) — we find-or-create one below.
+      // `conversation_id` targets an existing thread (inbox).
       conversation_id: conversationIdInput,
+
+      // `contact_id` lets a caller initiate from a contact that may have
+      // no conversation yet.
       contact_id,
+
+      // Required when using `contact_id` to select which WhatsApp number
+      // owns the new conversation.
+      whatsapp_config_id,
+
       message_type,
       content_text,
       media_url,
@@ -83,21 +86,28 @@ export async function POST(request: Request) {
       })
     } catch (err) {
       if (err instanceof SendMessageError) {
-        return NextResponse.json({ error: err.message }, { status: err.status })
+        return NextResponse.json(
+          { error: err.message },
+          { status: err.status }
+        )
       }
+
       throw err
     }
 
-    // Resolve the target conversation. With `conversation_id` we load the
-    // existing thread; with `contact_id` we find-or-create one for the
-    // contact so a business-initiated template send (Contact detail view)
-    // reuses the shared send core below.
+    // Resolve the target conversation.
+    //
+    // Existing conversations already contain whatsapp_config_id, so the
+    // channel selected when the conversation was created is preserved.
+    //
+    // For contact_id, whatsapp_config_id is required because an account
+    // may now have multiple WhatsApp numbers.
     let conversationId: string | null = null
 
     if (conversationIdInput) {
       const { data, error: convError } = await supabase
         .from('conversations')
-        .select('id')
+        .select('id, whatsapp_config_id')
         .eq('id', conversationIdInput)
         .eq('account_id', accountId)
         .single()
@@ -108,10 +118,31 @@ export async function POST(request: Request) {
           { status: 404 }
         )
       }
+
+      if (!data.whatsapp_config_id) {
+        return NextResponse.json(
+          {
+            error:
+              'This conversation is not associated with a WhatsApp number',
+          },
+          { status: 400 }
+        )
+      }
+
       conversationId = data.id
     } else {
-      // contact_id path: verify the contact is in this account first so a
-      // caller can't open a conversation against someone else's contact.
+      if (!whatsapp_config_id) {
+        return NextResponse.json(
+          {
+            error:
+              'whatsapp_config_id is required when sending to a contact without a conversation',
+          },
+          { status: 400 }
+        )
+      }
+
+      // Verify the contact is in this account first so a caller can't open
+      // a conversation against someone else's contact.
       const { data: contactRow, error: contactErr } = await supabase
         .from('contacts')
         .select('id')
@@ -126,18 +157,38 @@ export async function POST(request: Request) {
         )
       }
 
+      // Verify that the selected WhatsApp configuration belongs to this
+      // account. This prevents a caller from attempting to create a
+      // conversation using another account's channel.
+      const { data: configRow, error: configErr } = await supabase
+        .from('whatsapp_config')
+        .select('id')
+        .eq('id', whatsapp_config_id)
+        .eq('account_id', accountId)
+        .maybeSingle()
+
+      if (configErr || !configRow) {
+        return NextResponse.json(
+          { error: 'WhatsApp configuration not found' },
+          { status: 404 }
+        )
+      }
+
       const resolved = await findOrCreateConversation(
         supabase,
         accountId,
         userId,
-        contact_id
+        contact_id,
+        whatsapp_config_id
       )
+
       if (!resolved) {
         return NextResponse.json(
           { error: 'Failed to open a conversation for this contact' },
           { status: 500 }
         )
       }
+
       conversationId = resolved
     }
 
@@ -149,9 +200,11 @@ export async function POST(request: Request) {
     }
 
     // Delegate to the shared send core (validates, sends to Meta with
-    // phone-variant retry, persists, pauses active flow runs). Its
-    // `SendMessageError` carries a machine code + HTTP status; the
-    // dashboard maps it to the internal `{ error }` shape.
+    // phone-variant retry, persists, pauses active flow runs).
+    //
+    // The send core obtains the WhatsApp configuration from the
+    // conversation's whatsapp_config_id, so no channel can be silently
+    // switched during an existing conversation.
     try {
       const result = await sendMessageToConversation(supabase, accountId, {
         conversationId,
@@ -179,6 +232,7 @@ export async function POST(request: Request) {
           { status: err.status }
         )
       }
+
       throw err
     }
   } catch (error) {
@@ -192,26 +246,45 @@ export async function POST(request: Request) {
 type SendSupabase = Awaited<ReturnType<typeof createClient>>
 
 /**
- * Return the contact's conversation id in this account, creating one if
- * it doesn't exist yet. Mirrors the webhook's find-or-create so an
- * inbound-then-outbound (or outbound-first) sequence converges on a single
- * thread per contact. Runs under the caller's RLS — the conversations_insert
- * policy requires account agent membership, which the caller already is.
+ * Return the contact's conversation id for the selected WhatsApp channel
+ * in this account, creating one if it doesn't exist yet.
+ *
+ * Conversation identity is now:
+ *
+ *   account_id + whatsapp_config_id + contact_id
+ *
+ * This allows the same contact to have separate conversations with
+ * different WhatsApp numbers belonging to the same account.
+ *
+ * Runs under the caller's RLS — the conversations_insert policy requires
+ * account agent membership, which the caller already is.
  */
 async function findOrCreateConversation(
   supabase: SendSupabase,
   accountId: string,
   userId: string,
   contactId: string,
+  whatsappConfigId: string,
 ): Promise<string | null> {
-  const { data: existing } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from('conversations')
     .select('id')
     .eq('account_id', accountId)
     .eq('contact_id', contactId)
+    .eq('whatsapp_config_id', whatsappConfigId)
     .maybeSingle()
 
-  if (existing) return existing.id
+  if (existingError) {
+    console.error(
+      'Error finding conversation for contact send:',
+      existingError.message
+    )
+    return null
+  }
+
+  if (existing) {
+    return existing.id
+  }
 
   const { data: created, error } = await supabase
     .from('conversations')
@@ -219,12 +292,31 @@ async function findOrCreateConversation(
       account_id: accountId,
       user_id: userId,
       contact_id: contactId,
+      whatsapp_config_id: whatsappConfigId,
     })
     .select('id')
     .single()
 
   if (error) {
-    console.error('Error creating conversation for contact send:', error.message)
+    // Another request may have created the same channel-specific
+    // conversation between our SELECT and INSERT. Recover it instead
+    // of returning an unnecessary 500.
+    const { data: raceWinner } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .eq('whatsapp_config_id', whatsappConfigId)
+      .maybeSingle()
+
+    if (raceWinner) {
+      return raceWinner.id
+    }
+
+    console.error(
+      'Error creating conversation for contact send:',
+      error.message
+    )
     return null
   }
 

@@ -87,10 +87,15 @@ export interface ResolvedTemplate {
  * omitted the language matched no row: no header components, and no
  * body to persist. Matching falls back through
  * exact → same base language → a sensible default.
+ *
+ * Templates are scoped to the selected WhatsApp configuration so two
+ * WhatsApp numbers in the same account can have templates with the same
+ * name and language without mixing their local rows.
  */
 export async function resolveTemplateRow(
   db: SupabaseClient,
   accountId: string,
+  whatsappConfigId: string,
   templateName: string,
   requestedLanguage?: string | null
 ): Promise<ResolvedTemplate> {
@@ -98,6 +103,7 @@ export async function resolveTemplateRow(
     .from('message_templates')
     .select('*')
     .eq('account_id', accountId)
+    .eq('whatsapp_config_id', whatsappConfigId)
     .eq('name', templateName);
 
   // Sorted here rather than with `.order()` so the only query-builder

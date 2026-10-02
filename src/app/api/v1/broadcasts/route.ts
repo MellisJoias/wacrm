@@ -59,23 +59,6 @@ export const maxDuration = 300;
 // ============================================================
 // Internal continuation
 // ============================================================
-//
-// Depois que o primeiro lote termina, esta função chama a rota
-// central de continuação:
-//
-// /api/v1/broadcasts/[id]
-//
-// Essa rota já possui:
-// - controle de lock
-// - planejamento do próximo lote
-// - limite de 12 por pass
-// - envio sequencial
-// - verificação dos pending
-// - espera de 20 segundos entre os passes
-// - continuação automática dos próximos passes
-//
-// A autenticação interna utiliza BROADCAST_INTERNAL_SECRET.
-// ============================================================
 
 async function triggerNextBroadcastPass(
   request: Request,
@@ -320,6 +303,22 @@ export async function POST(
         ? body.template_name
         : '';
 
+    const whatsappConfigId =
+      typeof body.whatsapp_config_id ===
+      'string'
+        ? body.whatsapp_config_id.trim()
+        : '';
+
+    if (
+      whatsappConfigId.length === 0
+    ) {
+      return fail(
+        'bad_request',
+        'whatsapp_config_id is required',
+        400,
+      );
+    }
+
     const recipients =
       Array.isArray(
         body.recipients,
@@ -379,6 +378,8 @@ export async function POST(
               ? body.name
               : null,
 
+          whatsappConfigId,
+
           templateName,
 
           templateLanguage:
@@ -400,14 +401,6 @@ export async function POST(
 
     // ----------------------------------------------------------
     // First delivery pass
-    // ----------------------------------------------------------
-    //
-    // O broadcast pode conter centenas de recipients.
-    //
-    // Não enviamos todos dentro de uma única execução.
-    //
-    // O primeiro pass recebe somente o tamanho definido pelo
-    // DELIVERY_BATCH_SIZE no broadcast-core.ts.
     // ----------------------------------------------------------
 
     const firstPass =
@@ -433,6 +426,9 @@ export async function POST(
             broadcastId:
               plan.broadcastId,
 
+            whatsappConfigId:
+              plan.whatsappConfigId,
+
             total:
               plan.planned.length,
 
@@ -455,6 +451,9 @@ export async function POST(
           {
             broadcastId:
               plan.broadcastId,
+
+            whatsappConfigId:
+              plan.whatsappConfigId,
           },
         );
 
@@ -512,6 +511,9 @@ export async function POST(
             broadcastId:
               plan.broadcastId,
 
+            whatsappConfigId:
+              plan.whatsappConfigId,
+
             pending:
               pendingCount ?? 0,
 
@@ -524,6 +526,9 @@ export async function POST(
           {
             broadcastId:
               plan.broadcastId,
+
+            whatsappConfigId:
+              plan.whatsappConfigId,
 
             accountId:
               ctx.accountId,
@@ -538,10 +543,6 @@ export async function POST(
 
       // --------------------------------------------------------
       // Automatically start next pass.
-      // --------------------------------------------------------
-      //
-      // A própria rota de continuação controla os 20 segundos
-      // antes do próximo bloco.
       // --------------------------------------------------------
 
       if (

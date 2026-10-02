@@ -462,6 +462,7 @@ async function processWebhook(
           message,
           senderContact,
           config.account_id,
+          config.id,
           config.user_id,
           decryptedAccessToken,
           config.mirror_inbound_media !== false
@@ -936,6 +937,7 @@ async function processMessage(
     wa_id: string
   },
   accountId: string,
+  whatsappConfigId: string,
   configOwnerUserId: string,
   accessToken: string,
   mirrorMedia: boolean
@@ -967,11 +969,16 @@ async function processMessage(
 
   // ----------------------------------------------------------
   // Find/create conversation
+  //
+  // IMPORTANT:
+  // A conversation is unique by:
+  // account + WhatsApp config + contact.
   // ----------------------------------------------------------
 
   const convResult =
     await findOrCreateConversation(
       accountId,
+      whatsappConfigId,
       configOwnerUserId,
       contactRecord.id
     )
@@ -1951,6 +1958,7 @@ async function findOrCreateContact(
 
 async function findOrCreateConversation(
   accountId: string,
+  whatsappConfigId: string,
   configOwnerUserId: string,
   contactId: string
 ) {
@@ -1963,6 +1971,10 @@ async function findOrCreateConversation(
     .eq(
       'account_id',
       accountId
+    )
+    .eq(
+      'whatsapp_config_id',
+      whatsappConfigId
     )
     .eq(
       'contact_id',
@@ -2009,6 +2021,9 @@ async function findOrCreateConversation(
       user_id:
         configOwnerUserId,
 
+      whatsapp_config_id:
+        whatsappConfigId,
+
       contact_id:
         contactId,
     })
@@ -2029,6 +2044,10 @@ async function findOrCreateConversation(
         .eq(
           'account_id',
           accountId
+        )
+        .eq(
+          'whatsapp_config_id',
+          whatsappConfigId
         )
         .eq(
           'contact_id',

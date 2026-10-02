@@ -26,6 +26,8 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
+import { resolveConversationByPhone } from '@/lib/whatsapp/resolve-conversation';
+
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
 import { decrypt } from '@/lib/whatsapp/encryption';
 
@@ -89,6 +91,8 @@ export interface CreateBroadcastParams {
 
   templateLanguage?: string | null;
 
+  whatsappConfigId: string;
+
   recipients:
     BroadcastRecipientInput[];
 
@@ -111,6 +115,8 @@ export interface BroadcastPlan {
   accountId: string;
 
   auditUserId: string;
+
+  whatsappConfigId: string;
 
   templateName: string;
 
@@ -230,12 +236,21 @@ export async function createBroadcast(
     templateName,
     recipients,
     headerMediaUrl,
+    whatsappConfigId,
   } = params;
 
   if (!templateName) {
     throw new BroadcastError(
       'bad_request',
       "'template_name' is required",
+      400,
+    );
+  }
+
+  if (!whatsappConfigId) {
+    throw new BroadcastError(
+      'bad_request',
+      "'whatsapp_config_id' is required",
       400,
     );
   }
@@ -269,6 +284,10 @@ export async function createBroadcast(
     .from('whatsapp_config')
     .select('*')
     .eq(
+      'id',
+      whatsappConfigId,
+    )
+    .eq(
       'account_id',
       accountId,
     )
@@ -280,7 +299,7 @@ export async function createBroadcast(
   ) {
     throw new BroadcastError(
       'whatsapp_not_configured',
-      'WhatsApp not configured. Please set up your WhatsApp integration first.',
+      'WhatsApp configuration not found for this account.',
       400,
     );
   }
@@ -294,6 +313,7 @@ export async function createBroadcast(
     await resolveTemplateRow(
       db,
       accountId,
+      whatsappConfigId,
       templateName,
       params.templateLanguage,
     );
@@ -432,6 +452,9 @@ export async function createBroadcast(
         p_user_id:
           auditUserId,
 
+        p_whatsapp_config_id:
+          whatsappConfigId,
+
         p_name:
           name ||
           `API broadcast (${templateName})`,
@@ -544,6 +567,8 @@ export async function createBroadcast(
 
     auditUserId,
 
+    whatsappConfigId,
+
     templateName,
 
     templateLanguage:
@@ -606,6 +631,7 @@ async function resolveBroadcastTemplateForPersistence(
       await resolveTemplateRow(
         db,
         plan.accountId,
+        plan.whatsappConfigId,
         plan.templateName,
         plan.templateLanguage,
       );
@@ -637,6 +663,10 @@ async function resolveBroadcastTemplateForPersistence(
       .eq(
         'account_id',
         plan.accountId,
+      )
+      .eq(
+        'whatsapp_config_id',
+        plan.whatsappConfigId,
       )
       .eq(
         'name',
@@ -757,6 +787,10 @@ async function resolveCanonicalConversation(
       plan.accountId,
     )
     .eq(
+      'whatsapp_config_id',
+      plan.whatsappConfigId,
+    )
+    .eq(
       'contact_id',
       recipient.contactId,
     )
@@ -803,6 +837,9 @@ async function resolveCanonicalConversation(
 
       contact_id:
         recipient.contactId,
+
+      whatsapp_config_id:
+        plan.whatsappConfigId,
     })
     .select('id')
     .single();
@@ -837,6 +874,10 @@ async function resolveCanonicalConversation(
       .eq(
         'account_id',
         plan.accountId,
+      )
+      .eq(
+        'whatsapp_config_id',
+        plan.whatsappConfigId,
       )
       .eq(
         'contact_id',
@@ -905,12 +946,18 @@ async function persistBroadcastMessage(
   };
 
   try {
-    resolved =
-      await resolveCanonicalConversation(
+    const resolvedByPhone =
+      await resolveConversationByPhone(
         db,
-        plan,
-        recipient,
+        plan.accountId,
+        plan.whatsappConfigId,
+        recipient.phone,
       );
+
+    resolved = {
+      conversationId:
+        resolvedByPhone.conversationId,
+    };
   } catch (error) {
     console.error(
       '[broadcast-core] failed to resolve canonical conversation:',
@@ -1013,6 +1060,10 @@ async function persistBroadcastMessage(
       .eq(
         'account_id',
         plan.accountId,
+      )
+      .eq(
+        'whatsapp_config_id',
+        plan.whatsappConfigId,
       );
 
     return;
@@ -1093,6 +1144,10 @@ async function persistBroadcastMessage(
     .eq(
       'account_id',
       plan.accountId,
+    )
+    .eq(
+      'whatsapp_config_id',
+      plan.whatsappConfigId,
     );
 }
 

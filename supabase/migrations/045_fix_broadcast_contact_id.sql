@@ -24,10 +24,6 @@ DECLARE
   v_config_account_id UUID;
 BEGIN
 
-  -- ----------------------------------------------------------
-  -- Validar canal
-  -- ----------------------------------------------------------
-
   IF p_whatsapp_config_id IS NULL THEN
     RAISE EXCEPTION
       'whatsapp_config_id é obrigatório para criar um broadcast.';
@@ -50,11 +46,6 @@ BEGIN
       p_whatsapp_config_id,
       p_account_id;
   END IF;
-
-
-  -- ----------------------------------------------------------
-  -- Criar broadcast
-  -- ----------------------------------------------------------
 
   INSERT INTO public.broadcasts (
     account_id,
@@ -80,11 +71,6 @@ BEGIN
   )
   RETURNING id
   INTO v_broadcast_id;
-
-
-  -- ----------------------------------------------------------
-  -- Criar recipients
-  -- ----------------------------------------------------------
 
   RETURN QUERY
   WITH ins AS (

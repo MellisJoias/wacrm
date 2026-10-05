@@ -38,6 +38,7 @@ interface BroadcastPayload {
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
   headerMediaUrl?: string;
+  whatsappConfigId: string;
 }
 
 interface UseBroadcastSendingReturn {
@@ -73,17 +74,13 @@ function normalizePhone(
     return '';
   }
 
-  // Remove prefixo internacional 00.
   if (phone.startsWith('00')) {
     phone = phone.slice(2);
   }
 
-  // Brasil com +55 / 55.
   if (phone.startsWith('55')) {
     const national = phone.slice(2);
 
-    // Celular brasileiro com 10 dígitos:
-    // DDD + 8 dígitos.
     if (
       national.length === 10 &&
       national.charAt(2) !== '9'
@@ -97,12 +94,10 @@ function normalizePhone(
     return phone;
   }
 
-  // Número nacional com 11 dígitos.
   if (phone.length === 11) {
     return `55${phone}`;
   }
 
-  // Número nacional com 10 dígitos.
   if (phone.length === 10) {
     return `55${phone.slice(
       0,
@@ -110,7 +105,6 @@ function normalizePhone(
     )}9${phone.slice(2)}`;
   }
 
-  // Números internacionais já completos.
   return phone;
 }
 
@@ -118,17 +112,6 @@ function normalizePhone(
  * ============================================================
  * RESOLVE VARIÁVEIS
  * ============================================================
- *
- * Resolve:
- *
- * {{1}} -> static
- * {{1}} -> field
- * {{1}} -> custom_field
- * {{1}} -> CSV
- *
- * A ordem é numérica:
- *
- * {{1}}, {{2}}, {{3}}
  */
 export function resolveVariables(
   variables: Record<string, VariableMapping>,
@@ -180,20 +163,6 @@ export function resolveVariables(
       return fieldMap[variable.value] ?? '';
     }
 
-    /**
-     * --------------------------------------------------------
-     * CSV
-     * --------------------------------------------------------
-     *
-     * IMPORTANTE:
-     *
-     * Se a configuração for:
-     *
-     * {{1}} -> CSV -> name
-     *
-     * o valor vem EXCLUSIVAMENTE da linha correspondente
-     * do CSV.
-     */
     if (variable.type === 'csv') {
       switch (variable.value) {
         case 'name':
@@ -393,11 +362,6 @@ async function upsertCsvContacts(
     return [];
   }
 
-  /**
-   * ----------------------------------------------------------
-   * 1. NORMALIZAR CSV
-   * ----------------------------------------------------------
-   */
   const uniqueByPhone = new Map<
     string,
     {
@@ -435,11 +399,6 @@ async function upsertCsvContacts(
     return [];
   }
 
-  /**
-   * ----------------------------------------------------------
-   * 2. BUSCAR CONTATOS EXISTENTES
-   * ----------------------------------------------------------
-   */
   const byPhone = new Map<
     string,
     Contact
@@ -481,11 +440,6 @@ async function upsertCsvContacts(
     }
   }
 
-  /**
-   * ----------------------------------------------------------
-   * 3. FALLBACK
-   * ----------------------------------------------------------
-   */
   const missingPhones =
     phones.filter(
       (phone) =>
@@ -530,11 +484,6 @@ async function upsertCsvContacts(
     }
   }
 
-  /**
-   * ----------------------------------------------------------
-   * 4. CRIAR CONTATOS AUSENTES
-   * ----------------------------------------------------------
-   */
   const missing = phones
     .filter(
       (phone) =>
@@ -591,10 +540,6 @@ async function upsertCsvContacts(
       continue;
     }
 
-    /**
-     * Condição de corrida:
-     * outro processo pode ter criado o contato.
-     */
     if (
       insertErr.code ===
         '23505' ||
@@ -637,11 +582,6 @@ async function upsertCsvContacts(
     );
   }
 
-  /**
-   * ----------------------------------------------------------
-   * 5. RETORNAR CONTATOS
-   * ----------------------------------------------------------
-   */
   const result: Contact[] = [];
 
   for (const phone of phones) {
@@ -653,10 +593,6 @@ async function upsertCsvContacts(
       continue;
     }
 
-    /**
-     * Fallback:
-     * o telefone do CSV continua sendo uma audiência válida.
-     */
     const csvContact =
       uniqueByPhone.get(phone);
 
@@ -766,11 +702,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
     let contacts: Contact[] = [];
 
-    /**
-     * --------------------------------------------------------
-     * TODOS
-     * --------------------------------------------------------
-     */
     if (
       audience.type === 'all'
     ) {
@@ -788,14 +719,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       }
 
       contacts = data ?? [];
-    }
-
-    /**
-     * --------------------------------------------------------
-     * TAGS
-     * --------------------------------------------------------
-     */
-    else if (
+    } else if (
       audience.type ===
         'tags' &&
       audience.tagIds &&
@@ -853,14 +777,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
         contacts = data ?? [];
       }
-    }
-
-    /**
-     * --------------------------------------------------------
-     * CAMPO PERSONALIZADO
-     * --------------------------------------------------------
-     */
-    else if (
+    } else if (
       audience.type ===
         'custom_field' &&
       audience.customField
@@ -870,14 +787,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           supabase,
           audience.customField,
         );
-    }
-
-    /**
-     * --------------------------------------------------------
-     * CSV
-     * --------------------------------------------------------
-     */
-    else if (
+    } else if (
       audience.type ===
       'csv'
     ) {
@@ -920,11 +830,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
     }
 
-    /**
-     * --------------------------------------------------------
-     * EXCLUSÕES
-     * --------------------------------------------------------
-     */
     if (
       audience.excludeTagIds &&
       audience.excludeTagIds
@@ -987,11 +892,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       createClient();
 
     try {
-      /**
-       * --------------------------------------------------------
-       * 1. AUTENTICAÇÃO
-       * --------------------------------------------------------
-       */
       const {
         data: {
           session,
@@ -1014,13 +914,14 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
+      if (!payload.whatsappConfigId) {
+        throw new Error(
+          'Selecione o WhatsApp que será usado no envio.',
+        );
+      }
+
       setProgress(5);
 
-      /**
-       * --------------------------------------------------------
-       * 2. RESOLVE AUDIÊNCIA
-       * --------------------------------------------------------
-       */
       const contacts =
         await resolveAudience(
           payload.audience,
@@ -1050,11 +951,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       setProgress(15);
 
-      /**
-       * --------------------------------------------------------
-       * 3. CUSTOM VALUES
-       * --------------------------------------------------------
-       */
       const realContactIds =
         contacts
           .map(
@@ -1074,24 +970,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           realContactIds,
         );
 
-      /**
-       * --------------------------------------------------------
-       * 4. INDEX CSV
-       * --------------------------------------------------------
-       *
-       * A linha original do CSV é preservada.
-       *
-       * O telefone normalizado é usado somente como chave.
-       *
-       * Isso garante:
-       *
-       * CSV:
-       * 5511999999999 | Maria
-       *
-       * ->
-       *
-       * {{1}} = Maria
-       */
       const csvByPhone =
         new Map<
           string,
@@ -1122,35 +1000,12 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      /**
-       * --------------------------------------------------------
-       * 5. MONTAR RECIPIENTS
-       * --------------------------------------------------------
-       */
       let recipients:
         {
           to: string;
           params: string[];
         }[] = [];
 
-      /**
-       * ========================================================
-       * CSV
-       * ========================================================
-       *
-       * Para CSV, usamos a própria lista CSV como origem dos
-       * recipients.
-       *
-       * Isso evita depender de qualquer diferença entre:
-       *
-       * CSV name
-       *
-       * e
-       *
-       * contacts.name
-       *
-       * no Supabase.
-       */
       if (
         payload.audience.type ===
           'csv' &&
@@ -1175,10 +1030,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
                   return null;
                 }
 
-                /**
-                 * Encontra o contato correspondente apenas
-                 * para campos que não são CSV.
-                 */
                 const contact =
                   contacts.find(
                     (
@@ -1240,11 +1091,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
                 ),
             );
       } else {
-        /**
-         * ======================================================
-         * CONTATOS NORMAIS
-         * ======================================================
-         */
         recipients =
           contacts
             .map(
@@ -1289,11 +1135,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             );
       }
 
-      /**
-       * --------------------------------------------------------
-       * 6. VALIDAR RECIPIENTS
-       * --------------------------------------------------------
-       */
       if (
         recipients.length === 0
       ) {
@@ -1302,29 +1143,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      /**
-       * --------------------------------------------------------
-       * 7. VALIDAR VARIÁVEIS DO TEMPLATE
-       * --------------------------------------------------------
-       *
-       * Exemplo:
-       *
-       * Template:
-       *
-       * Olá {{1}}
-       *
-       * exige pelo menos:
-       *
-       * params: ['Maria']
-       *
-       * Nunca permitimos:
-       *
-       * params: []
-       *
-       * porque isso causaria:
-       *
-       * Body has 1 variable(s) but only 0 value(s)
-       */
       const bodyVariableCount =
         getBodyVariableCount(
           payload.template,
@@ -1363,16 +1181,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         }
       }
 
-      /**
-       * --------------------------------------------------------
-       * LOG DETALHADO
-       * --------------------------------------------------------
-       *
-       * Mantido para facilitar diagnóstico de campanhas.
-       *
-       * NÃO imprime o conteúdo completo de todos os recipients
-       * quando a campanha é grande.
-       */
       console.log(
         '[broadcast] Recipients prepared:',
         {
@@ -1381,6 +1189,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           bodyVariableCount,
           variableMappings:
             payload.variables,
+          whatsappConfigId:
+            payload.whatsappConfigId,
           sample:
             recipients
               .slice(0, 10)
@@ -1399,26 +1209,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       setProgress(25);
 
-      /**
-       * --------------------------------------------------------
-       * 8. CRIAR CAMPANHA NO SERVIDOR
-       * --------------------------------------------------------
-       *
-       * O navegador NÃO envia WhatsApp.
-       *
-       * Ele somente entrega a campanha ao endpoint:
-       *
-       * POST /api/v1/broadcasts
-       *
-       * O broadcast-core fica responsável por:
-       *
-       * broadcasts
-       * broadcast_recipients
-       * template_params
-       * entrega
-       * retry
-       * status
-       */
       const response =
         await fetch(
           '/api/v1/broadcasts',
@@ -1442,6 +1232,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
                 payload.template
                   .language ??
                 'pt_BR',
+              whatsapp_config_id:
+                payload.whatsappConfigId,
               recipients,
             }),
           },
@@ -1479,11 +1271,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         },
       );
 
-      /**
-       * --------------------------------------------------------
-       * 9. ERRO DO SERVIDOR
-       * --------------------------------------------------------
-       */
       if (!response.ok) {
         throw new Error(
           result?.error ??
@@ -1492,11 +1279,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      /**
-       * --------------------------------------------------------
-       * 10. ID DA CAMPANHA
-       * --------------------------------------------------------
-       */
       const broadcastId =
         result?.data
           ?.broadcast_id;
@@ -1507,11 +1289,6 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      /**
-       * A campanha já foi persistida.
-       *
-       * O servidor continua a entrega.
-       */
       setProgress(100);
 
       return broadcastId;

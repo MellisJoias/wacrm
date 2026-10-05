@@ -1,6 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import {
+  useEffect,
+  useState,
+} from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
@@ -13,6 +16,13 @@ import { Step4ScheduleSend } from '@/components/broadcasts/step4-schedule-send';
 import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
 import { Check } from 'lucide-react';
 import { useTranslations } from 'next-intl';
+
+interface BroadcastWhatsAppConfig {
+  id: string;
+  display_name: string | null;
+  phone_number_id: string;
+  status: string | null;
+}
 
 const steps = [
   { label: 'template', key: 'template' },
@@ -89,8 +99,94 @@ export default function NewBroadcastPage() {
   const [name, setName] =
     useState('');
 
+  const [
+    whatsappConfigs,
+    setWhatsappConfigs,
+  ] = useState<
+    BroadcastWhatsAppConfig[]
+  >([]);
+
+  const [
+    whatsappConfigId,
+    setWhatsappConfigId,
+  ] = useState('');
+
+  useEffect(() => {
+    if (!accountId) {
+      return;
+    }
+
+    async function loadWhatsAppConfigs() {
+      const supabase =
+        createClient();
+
+      const {
+        data,
+        error,
+      } = await supabase
+        .from('whatsapp_config')
+        .select(
+          'id, display_name, phone_number_id, status',
+        )
+        .eq(
+          'account_id',
+          accountId,
+        )
+        .order(
+          'created_at',
+          {
+            ascending: true,
+          },
+        );
+
+      if (error) {
+        console.error(
+          'Failed to load WhatsApp configs:',
+          error,
+        );
+
+        toast.error(
+          'Não foi possível carregar os WhatsApps',
+        );
+
+        return;
+      }
+
+      const configs =
+        (data ??
+          []) as BroadcastWhatsAppConfig[];
+
+      setWhatsappConfigs(
+        configs,
+      );
+
+      if (
+        configs.length > 0 &&
+        !whatsappConfigId
+      ) {
+        setWhatsappConfigId(
+          configs[0].id,
+        );
+      }
+    }
+
+    loadWhatsAppConfigs();
+  }, [
+    accountId,
+    whatsappConfigId,
+  ]);
+
   async function handleSend() {
-    if (!template) return;
+    if (!template) {
+      return;
+    }
+
+    if (!whatsappConfigId) {
+      toast.error(
+        'Selecione o WhatsApp que será usado no envio',
+      );
+      return;
+    }
 
     try {
       const broadcastId =
@@ -111,6 +207,7 @@ export default function NewBroadcastPage() {
 
           variables,
           headerMediaUrl,
+          whatsappConfigId,
         });
 
       router.push(
@@ -142,11 +239,13 @@ export default function NewBroadcastPage() {
       return;
     }
 
-    const supabase = createClient();
+    const supabase =
+      createClient();
 
     const {
       data: { session },
-    } = await supabase.auth.getSession();
+    } =
+      await supabase.auth.getSession();
 
     const user = session?.user;
 
@@ -396,6 +495,15 @@ export default function NewBroadcastPage() {
                 }
                 audience={
                   audience
+                }
+                whatsappConfigs={
+                  whatsappConfigs
+                }
+                whatsappConfigId={
+                  whatsappConfigId
+                }
+                onWhatsappConfigChange={
+                  setWhatsappConfigId
                 }
                 onSend={
                   handleSend

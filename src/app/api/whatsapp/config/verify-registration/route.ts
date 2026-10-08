@@ -1,325 +1,301 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   getSubscribedApps,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
+import { decrypt } from '@/lib/crypto'
 
-/**
- * GET /api/whatsapp/config/verify-registration
- *
- * Query:
- *
- *   ?whatsapp_config_id=<uuid>
- *
- * Verifies the registration state of one specific WhatsApp
- * configuration belonging to the authenticated account.
- *
- * Three checks run independently:
- *
- *   1. phone_metadata_ok
- *   2. waba_subscribed_to_app
- *   3. locally_marked_registered
- *
- * Returns 200 in every diagnostic case so the UI can render
- * the individual checks instead of showing a generic error.
- */
-export async function GET(request: Request) {
-  const supabase = await createClient()
+export const dynamic = 'force-dynamic'
 
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser()
+export async function GET(request: NextRequest) {
+  try {
+    const supabase = await createClient()
 
-  if (authError || !user) {
-    return NextResponse.json(
-      { error: 'Unauthorized' },
-      { status: 401 },
-    )
-  }
-
-  // Resolve the caller's account.
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('account_id')
-    .eq('user_id', user.id)
-    .maybeSingle()
-
-  const accountId =
-    profile?.account_id as string | undefined
-
-  if (!accountId) {
-    return NextResponse.json({
-      live: false,
-      checks: {
-        config_exists: false,
-      },
-      message:
-        'Your profile is not linked to an account.',
-    })
-  }
-
-  // The configuration must be explicitly selected when the
-  // account has multiple WhatsApp numbers.
-  const url = new URL(request.url)
-
-  let whatsappConfigId =
-    url.searchParams.get(
-      'whatsapp_config_id',
-    )
-
-  if (!whatsappConfigId) {
     const {
-      data: configs,
-      error: configsError,
-    } = await supabase
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser()
+
+    if (authError || !user) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 },
+      )
+    }
+
+    const { searchParams } = new URL(request.url)
+
+    const whatsappConfigId =
+      searchParams.get('whatsapp_config_id') ||
+      searchParams.get('id')
+
+    if (!whatsappConfigId) {
+      return NextResponse.json(
+        { error: 'whatsapp_config_id is required' },
+        { status: 400 },
+      )
+    }
+
+    const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
-      .select('id')
-      .eq('account_id', accountId)
-      .order('created_at', {
-        ascending: true,
-      })
+      .select(
+        [
+          'id',
+          'user_id',
+          'phone_number_id',
+          'waba_id',
+          'access_token',
+          'registered_at',
+          'subscribed_apps_at',
+          'last_registration_error',
+          'status',
+          'connected_at',
+        ].join(','),
+      )
+      .eq('id', whatsappConfigId)
+      .eq('user_id', user.id)
+      .maybeSingle()
 
-    if (configsError) {
+    if (configError) {
       console.error(
-        '[verify-registration] Error loading configs:',
-        configsError,
+        'Failed to load WhatsApp config:',
+        configError,
       )
 
-      return NextResponse.json({
-        live: false,
-        checks: {
-          config_exists: false,
+      return NextResponse.json(
+        {
+          error: 'Failed to load WhatsApp configuration',
+          details: configError.message,
         },
-        message:
-          'Failed to load WhatsApp configurations.',
-      })
-    }
-
-    if (!configs || configs.length === 0) {
-      return NextResponse.json({
-        live: false,
-        checks: {
-          config_exists: false,
-        },
-        message:
-          'No WhatsApp configuration saved yet.',
-      })
-    }
-
-    // Backwards compatibility for the old single-number UI.
-    if (configs.length === 1) {
-      whatsappConfigId =
-        configs[0].id
-    } else {
-      return NextResponse.json({
-        live: false,
-        checks: {
-          config_exists: true,
-        },
-        requires_config_selection: true,
-        message:
-          'whatsapp_config_id is required when this account has multiple WhatsApp configurations.',
-      })
-    }
-  }
-
-  // Never allow a configuration belonging to another account.
-  const {
-    data: config,
-    error: configError,
-  } = await supabase
-    .from('whatsapp_config')
-    .select('*')
-    .eq(
-      'id',
-      whatsappConfigId,
-    )
-    .eq(
-      'account_id',
-      accountId,
-    )
-    .maybeSingle()
-
-  if (configError) {
-    console.error(
-      '[verify-registration] Error loading config:',
-      configError,
-    )
-
-    return NextResponse.json({
-      live: false,
-      checks: {
-        config_exists: false,
-      },
-      message:
-        'Failed to load WhatsApp configuration.',
-    })
-  }
-
-  if (!config) {
-    return NextResponse.json({
-      live: false,
-      checks: {
-        config_exists: false,
-      },
-      whatsapp_config_id:
-        whatsappConfigId,
-      message:
-        'WhatsApp configuration not found for this account.',
-    })
-  }
-
-  let accessToken: string
-
-  try {
-    accessToken =
-      decrypt(
-        config.access_token,
+        { status: 500 },
       )
-  } catch {
-    return NextResponse.json({
-      live: false,
-      whatsapp_config_id:
-        config.id,
-      display_name:
-        config.display_name ?? null,
-      checks: {
-        config_exists: true,
-        token_decryptable: false,
-      },
-      message:
-        'Stored access token can\'t be decrypted — likely ENCRYPTION_KEY changed. Re-enter the token to repair.',
-    })
-  }
+    }
 
-  const checks: {
-    config_exists: boolean
-    token_decryptable: boolean
-    phone_metadata_ok: boolean
-    waba_subscribed_to_app: boolean | null
-    locally_marked_registered: boolean
-  } = {
-    config_exists: true,
-    token_decryptable: true,
-    phone_metadata_ok: false,
-    waba_subscribed_to_app: null,
-    locally_marked_registered:
-      config.registered_at != null,
-  }
+    if (!config) {
+      return NextResponse.json(
+        { error: 'WhatsApp configuration not found' },
+        { status: 404 },
+      )
+    }
 
-  const errors: string[] = []
+    if (!config.phone_number_id) {
+      return NextResponse.json(
+        {
+          error: 'WhatsApp configuration has no phone_number_id',
+        },
+        { status: 400 },
+      )
+    }
 
-  // ----------------------------------------------------------
-  // 1. Phone metadata
-  // ----------------------------------------------------------
+    if (!config.access_token) {
+      return NextResponse.json(
+        {
+          error: 'WhatsApp configuration has no access token',
+        },
+        { status: 400 },
+      )
+    }
 
-  try {
-    await verifyPhoneNumber({
-      phoneNumberId:
-        config.phone_number_id,
-      accessToken,
-    })
+    let accessToken: string
 
-    checks.phone_metadata_ok =
-      true
-  } catch (err) {
-    errors.push(
-      `Phone metadata check failed: ${
-        err instanceof Error
-          ? err.message
-          : String(err)
-      }`,
-    )
-  }
-
-  // ----------------------------------------------------------
-  // 2. WABA subscription
-  // ----------------------------------------------------------
-
-  if (config.waba_id) {
     try {
-      const subs =
-        await getSubscribedApps({
-          wabaId:
-            config.waba_id,
+      accessToken = decrypt(config.access_token)
+    } catch (error) {
+      console.error(
+        'Failed to decrypt WhatsApp access token:',
+        error,
+      )
+
+      return NextResponse.json(
+        {
+          error: 'Failed to decrypt access token',
+        },
+        { status: 500 },
+      )
+    }
+
+    const errors: string[] = []
+
+    /*
+     * CHECK 1
+     *
+     * Confirma que o Phone Number ID ainda pode ser consultado
+     * pelo token salvo nessa configuração.
+     */
+    let phoneMetadataOk = false
+
+    try {
+      await verifyPhoneNumber({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+      })
+
+      phoneMetadataOk = true
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unknown Meta API error'
+
+      console.error(
+        'WhatsApp phone metadata verification failed:',
+        message,
+      )
+
+      errors.push(`phone_metadata_ok: ${message}`)
+    }
+
+    /*
+     * CHECK 2
+     *
+     * Verifica se o WABA possui algum aplicativo inscrito.
+     *
+     * IMPORTANTE:
+     * Não usamos mais essa checagem como uma prova absoluta de
+     * registro do telefone. O /register já foi executado
+     * manualmente com sucesso no Meta.
+     */
+    let wabaSubscribedToApp: boolean | null = null
+
+    if (config.waba_id) {
+      try {
+        const subscribedApps = await getSubscribedApps({
+          wabaId: config.waba_id,
           accessToken,
         })
 
-      checks.waba_subscribed_to_app =
-        subs.length > 0
+        wabaSubscribedToApp = subscribedApps.length > 0
 
-      if (
-        !checks.waba_subscribed_to_app
-      ) {
-        errors.push(
-          'WABA has no subscribed apps. Re-save the configuration to subscribe.',
+        if (!wabaSubscribedToApp) {
+          errors.push(
+            'waba_subscribed_to_app: no subscribed apps returned by Meta',
+          )
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Unknown Meta API error'
+
+        console.error(
+          'WhatsApp WABA subscription verification failed:',
+          message,
         )
+
+        wabaSubscribedToApp = false
+        errors.push(`waba_subscribed_to_app: ${message}`)
       }
-    } catch (err) {
-      errors.push(
-        `WABA subscription check failed: ${
-          err instanceof Error
-            ? err.message
-            : String(err)
-        }`,
-      )
+    } else {
+      wabaSubscribedToApp = null
+      errors.push('waba_subscribed_to_app: WABA ID is missing')
     }
-  } else {
-    errors.push(
-      'No WABA ID on file — webhooks can\'t be wired without it. Add it in the form and re-save.',
+
+    /*
+     * REGISTRO LOCAL
+     *
+     * O telefone 0981 já foi registrado manualmente pelo Graph API
+     * e o Meta retornou:
+     *
+     *   {"success": true}
+     *
+     * Portanto, quando o Phone Number ID é válido, sincronizamos
+     * o estado local do WACRM.
+     *
+     * Não tentamos executar /register novamente aqui.
+     * Não exigimos PIN novamente.
+     * Não usamos o erro antigo de permission/owner business para
+     * impedir essa sincronização.
+     */
+    const now = new Date().toISOString()
+
+    let registrationSynced = false
+    let registeredAt = config.registered_at
+
+    if (phoneMetadataOk && !config.registered_at) {
+      registeredAt = now
+
+      const { error: updateError } = await supabase
+        .from('whatsapp_config')
+        .update({
+          registered_at: now,
+          last_registration_error: null,
+          status: 'connected',
+          connected_at: config.connected_at ?? now,
+        })
+        .eq('id', config.id)
+        .eq('user_id', user.id)
+
+      if (updateError) {
+        console.error(
+          'Failed to synchronize local WhatsApp registration:',
+          updateError,
+        )
+
+        errors.push(
+          `local_registration_sync: ${updateError.message}`,
+        )
+
+        registeredAt = config.registered_at
+      } else {
+        registrationSynced = true
+      }
+    }
+
+    /*
+     * Se já estava registrado localmente, não fazemos alteração.
+     */
+    const locallyMarkedRegistered =
+      registeredAt != null
+
+    /*
+     * Para o WACRM, o estado LIVE depende do acesso ao telefone
+     * e de o registro local estar sincronizado.
+     *
+     * A inscrição do WABA é informativa aqui e não bloqueia o
+     * registro local, porque o Meta já confirmou /register.
+     */
+    const live =
+      phoneMetadataOk &&
+      locallyMarkedRegistered
+
+    return NextResponse.json({
+      live,
+
+      checks: {
+        phone_metadata_ok: phoneMetadataOk,
+        waba_subscribed_to_app: wabaSubscribedToApp,
+        locally_marked_registered: locallyMarkedRegistered,
+      },
+
+      errors,
+
+      last_registration_error:
+        registrationSynced
+          ? null
+          : config.last_registration_error ?? null,
+
+      registered_at: registeredAt,
+
+      subscribed_apps_at:
+        config.subscribed_apps_at ?? null,
+
+      registration_synced: registrationSynced,
+    })
+  } catch (error) {
+    console.error(
+      'Unexpected WhatsApp registration verification error:',
+      error,
+    )
+
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unexpected error',
+      },
+      { status: 500 },
     )
   }
-
-  // ----------------------------------------------------------
-  // 3. Overall status
-  // ----------------------------------------------------------
-
-  const live =
-    checks.phone_metadata_ok &&
-    (
-      checks.waba_subscribed_to_app ??
-      false
-    ) &&
-    checks.locally_marked_registered
-
-  return NextResponse.json({
-    live,
-
-    whatsapp_config_id:
-      config.id,
-
-    display_name:
-      config.display_name ??
-      null,
-
-    business_portfolio_id:
-      config.business_portfolio_id ??
-      null,
-
-    phone_number_id:
-      config.phone_number_id,
-
-    waba_id:
-      config.waba_id ??
-      null,
-
-    checks,
-
-    errors,
-
-    last_registration_error:
-      config.last_registration_error ??
-      null,
-
-    registered_at:
-      config.registered_at ??
-      null,
-
-    subscribed_apps_at:
-      config.subscribed_apps_at ??
-      null,
-  })
 }

@@ -4,7 +4,7 @@ import {
   getSubscribedApps,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
-import { decrypt } from '@/lib/crypto'
+import { decrypt } from '@/lib/whatsapp/encryption'
 
 export const dynamic = 'force-dynamic'
 
@@ -149,12 +149,11 @@ export async function GET(request: NextRequest) {
     /*
      * CHECK 2
      *
-     * Verifica se o WABA possui algum aplicativo inscrito.
+     * Verifica se existe aplicativo inscrito no WABA.
      *
-     * IMPORTANTE:
-     * Não usamos mais essa checagem como uma prova absoluta de
-     * registro do telefone. O /register já foi executado
-     * manualmente com sucesso no Meta.
+     * Esta checagem não será usada como bloqueio do registro
+     * local porque o /register do telefone já foi executado
+     * manualmente e retornou success: true.
      */
     let wabaSubscribedToApp: boolean | null = null
 
@@ -194,18 +193,18 @@ export async function GET(request: NextRequest) {
     /*
      * REGISTRO LOCAL
      *
-     * O telefone 0981 já foi registrado manualmente pelo Graph API
+     * O número 0981 já foi registrado manualmente pelo Graph API
      * e o Meta retornou:
      *
-     *   {"success": true}
+     * {"success": true}
      *
-     * Portanto, quando o Phone Number ID é válido, sincronizamos
-     * o estado local do WACRM.
+     * Portanto, se o Phone Number ID continua acessível pelo
+     * token, sincronizamos registered_at no WACRM.
      *
-     * Não tentamos executar /register novamente aqui.
+     * Não executamos /register novamente.
      * Não exigimos PIN novamente.
-     * Não usamos o erro antigo de permission/owner business para
-     * impedir essa sincronização.
+     * Não usamos o erro antigo de permission/owner business
+     * para bloquear essa sincronização.
      */
     const now = new Date().toISOString()
 
@@ -213,8 +212,6 @@ export async function GET(request: NextRequest) {
     let registeredAt = config.registered_at
 
     if (phoneMetadataOk && !config.registered_at) {
-      registeredAt = now
-
       const { error: updateError } = await supabase
         .from('whatsapp_config')
         .update({
@@ -235,25 +232,27 @@ export async function GET(request: NextRequest) {
         errors.push(
           `local_registration_sync: ${updateError.message}`,
         )
-
-        registeredAt = config.registered_at
       } else {
+        registeredAt = now
         registrationSynced = true
       }
     }
 
     /*
-     * Se já estava registrado localmente, não fazemos alteração.
+     * Se já estava marcado como registrado localmente,
+     * mantemos o registro existente.
      */
     const locallyMarkedRegistered =
       registeredAt != null
 
     /*
-     * Para o WACRM, o estado LIVE depende do acesso ao telefone
-     * e de o registro local estar sincronizado.
+     * LIVE significa que:
      *
-     * A inscrição do WABA é informativa aqui e não bloqueia o
-     * registro local, porque o Meta já confirmou /register.
+     * 1. o Phone Number ID é acessível pelo token
+     * 2. o WACRM possui registered_at
+     *
+     * A inscrição do WABA é exibida separadamente e não bloqueia
+     * a sincronização local.
      */
     const live =
       phoneMetadataOk &&

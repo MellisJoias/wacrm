@@ -346,32 +346,30 @@ export async function POST(request: Request) {
   try {
     const untrustedBody = JSON.parse(rawBodyText)
 
-    const entries: Array<{
-      id?: unknown
-      changes?: Array<{
-        field?: unknown
-        value?: {
-          metadata?: {
-            phone_number_id?: unknown
-          }
-        }
-      }>
-    }> = Array.isArray(untrustedBody.entry)
+    const entries = Array.isArray(untrustedBody.entry)
       ? untrustedBody.entry
       : []
 
-    const wabaIds: string[] = entries
-      .map((entry) => entry.id)
+    const wabaIds = entries
+      .map((entry: { id?: string }) => entry.id)
       .filter(
-        (id): id is string =>
+        (id: unknown): id is string =>
           typeof id === 'string'
       )
 
-    const phoneNumberIds: string[] = entries.flatMap(
-      (entry) =>
+    const phoneNumberIds = entries.flatMap(
+      (entry: {
+        changes?: Array<{
+          value?: {
+            metadata?: {
+              phone_number_id?: string
+            }
+          }
+        }>
+      }) =>
         (entry.changes ?? [])
           .map(
-            (change) =>
+            change =>
               change.value?.metadata?.phone_number_id
           )
           .filter(
@@ -380,10 +378,12 @@ export async function POST(request: Request) {
           )
     )
 
-    const fields: string[] = entries.flatMap(
-      (entry) =>
+    const fields = entries.flatMap(
+      (entry: {
+        changes?: Array<{ field?: string }>
+      }) =>
         (entry.changes ?? [])
-          .map((change) => change.field)
+          .map(change => change.field)
           .filter(
             (field): field is string =>
               typeof field === 'string'
@@ -392,8 +392,8 @@ export async function POST(request: Request) {
 
     diagnostic = {
       wabaId: [...new Set(wabaIds)].join(',') || undefined,
-      phoneNumberIds: [...new Set(phoneNumberIds)],
-      fields: [...new Set(fields)],
+      phoneNumberIds: [...new Set<string>(phoneNumberIds as string[])],
+      fields: [...new Set<string>(fields as string[])],
     }
   } catch {
     // Invalid JSON is not processed.
@@ -410,7 +410,7 @@ export async function POST(request: Request) {
     environment: process.env.VERCEL_ENV ?? 'unknown',
   })
 
-  // Verify the signature against the original request bytes.
+  // Do not process or accept the event unless its signature is valid.
   if (!verifyMetaWebhookSignature(rawBody, signature)) {
     console.error('[WEBHOOK-DIAGNOSTIC] Signature rejected', {
       ...diagnostic,

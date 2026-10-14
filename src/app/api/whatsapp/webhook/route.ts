@@ -392,8 +392,8 @@ export async function POST(request: Request) {
 
     diagnostic = {
       wabaId: [...new Set(wabaIds)].join(',') || undefined,
-      phoneNumberIds: [...new Set(phoneNumberIds)],
-      fields: [...new Set(fields)],
+      phoneNumberIds: [...new Set<string>(phoneNumberIds as string[])],
+      fields: [...new Set<string>(fields as string[])],
     }
   } catch {
     // Invalid JSON is not processed.
@@ -411,7 +411,7 @@ export async function POST(request: Request) {
   })
 
   // Do not process or accept the event unless its signature is valid.
-  if (!verifyMetaWebhookSignature(rawBodyText, signature)) {
+  if (!verifyMetaWebhookSignature(rawBody, signature)) {
     console.error('[WEBHOOK-DIAGNOSTIC] Signature rejected', {
       ...diagnostic,
       bodyBytes: rawBody.length,

@@ -118,12 +118,6 @@ interface WhatsAppMessage {
     address?: string
   }
 
-  /**
-   * WhatsApp sends shared contact cards using:
-   *
-   * type: "contacts"
-   * contacts: [...]
-   */
   contacts?: WhatsAppContactCard[]
 
   reaction?: {
@@ -144,17 +138,11 @@ interface WhatsAppMessage {
     }
   }
 
-  /**
-   * Quick-reply tap on a WhatsApp template.
-   */
   button?: {
     text?: string
     payload?: string
   }
 
-  /**
-   * Present when the customer replies to one of our messages.
-   */
   context?: {
     id: string
   }
@@ -187,9 +175,6 @@ interface WhatsAppWebhookEntry {
         timestamp: string
         recipient_id: string
 
-        // ======================================================
-        // Meta sends this array when a message fails.
-        // ======================================================
         errors?: Array<{
           code?: number
           title?: string
@@ -211,26 +196,48 @@ interface WhatsAppWebhookEntry {
 
 export async function GET(request: Request) {
   try {
-    const { searchParams } = new URL(request.url)
+    const url = new URL(request.url)
 
-    const mode = searchParams.get('hub.mode')
-    const challenge = searchParams.get('hub.challenge')
-    const verifyToken = searchParams.get('hub.verify_token')
+    console.log('[webhook][GET] Verification request:', {
+      url: url.toString(),
+      mode: url.searchParams.get('hub.mode'),
+      challenge: url.searchParams.get('hub.challenge'),
+      hasVerifyToken: Boolean(
+        url.searchParams.get('hub.verify_token')
+      ),
+      userAgent: request.headers.get('user-agent'),
+    })
+
+    const mode = url.searchParams.get('hub.mode')
+    const challenge = url.searchParams.get('hub.challenge')
+    const verifyToken = url.searchParams.get('hub.verify_token')
 
     if (mode !== 'subscribe' || !challenge || !verifyToken) {
+      console.warn(
+        '[webhook][GET] Missing/invalid verification parameters'
+      )
+
       return NextResponse.json(
-        { error: 'Missing verification parameters' },
+        {
+          error: 'Missing verification parameters',
+          received: {
+            mode,
+            hasChallenge: Boolean(challenge),
+            hasVerifyToken: Boolean(verifyToken),
+          },
+        },
         { status: 400 }
       )
     }
 
-    const { data: configs, error: configError } = await supabaseAdmin()
-      .from('whatsapp_config')
-      .select('id, verify_token')
+    const { data: configs, error: configError } =
+      await supabaseAdmin()
+        .from('whatsapp_config')
+        .select('id, verify_token, phone_number_id')
 
     if (configError || !configs) {
       console.error(
-        'Error fetching configs for verification:',
+        '[webhook][GET] Error fetching configs for verification:',
         configError
       )
 
@@ -247,16 +254,31 @@ export async function GET(request: Request) {
       if (!config.verify_token) continue
 
       try {
-        if (decrypt(config.verify_token) === verifyToken) {
+        const decryptedToken =
+          decrypt(config.verify_token)
+
+        if (decryptedToken === verifyToken) {
           matchedConfig = config
           break
         }
       } catch {
-        // Invalid/malformed token. Continue checking other configs.
+        console.warn(
+          '[webhook][GET] Could not decrypt verify token for config:',
+          config.id
+        )
       }
     }
 
     if (matchedConfig) {
+      console.log(
+        '[webhook][GET] Verification successful:',
+        {
+          configId: matchedConfig.id,
+          phoneNumberId:
+            matchedConfig.phone_number_id,
+        }
+      )
+
       if (isLegacyFormat(matchedConfig.verify_token)) {
         void supabaseAdmin()
           .from('whatsapp_config')
@@ -282,13 +304,17 @@ export async function GET(request: Request) {
       })
     }
 
+    console.warn(
+      '[webhook][GET] Verification token mismatch'
+    )
+
     return NextResponse.json(
       { error: 'Verification token mismatch' },
       { status: 403 }
     )
   } catch (error) {
     console.error(
-      'Error in webhook GET verification:',
+      '[webhook][GET] Error in webhook verification:',
       error
     )
 
@@ -304,10 +330,94 @@ export async function GET(request: Request) {
 // ============================================================
 
 export async function POST(request: Request) {
-  const rawBody = await request.text()
+  // Read the original request body as bytes.
+  const rawBody = Buffer.from(await request.arrayBuffer())
+  const rawBodyText = rawBody.toString('utf8')
   const signature = request.headers.get('x-hub-signature-256')
 
-  if (!verifyMetaWebhookSignature(rawBody, signature)) {
+  // Diagnostic information only.
+  // This JSON is untrusted until signature verification succeeds.
+  let diagnostic: {
+    wabaId?: string
+    phoneNumberIds?: string[]
+    fields?: string[]
+  } = {}
+
+  try {
+    const untrustedBody = JSON.parse(rawBodyText)
+
+    const entries = Array.isArray(untrustedBody.entry)
+      ? untrustedBody.entry
+      : []
+
+    const wabaIds = entries
+      .map((entry: { id?: string }) => entry.id)
+      .filter(
+        (id: unknown): id is string =>
+          typeof id === 'string'
+      )
+
+    const phoneNumberIds = entries.flatMap(
+      (entry: {
+        changes?: Array<{
+          value?: {
+            metadata?: {
+              phone_number_id?: string
+            }
+          }
+        }>
+      }) =>
+        (entry.changes ?? [])
+          .map(
+            change =>
+              change.value?.metadata?.phone_number_id
+          )
+          .filter(
+            (id): id is string =>
+              typeof id === 'string'
+          )
+    )
+
+    const fields = entries.flatMap(
+      (entry: {
+        changes?: Array<{ field?: string }>
+      }) =>
+        (entry.changes ?? [])
+          .map(change => change.field)
+          .filter(
+            (field): field is string =>
+              typeof field === 'string'
+          )
+    )
+
+    diagnostic = {
+      wabaId: [...new Set(wabaIds)].join(',') || undefined,
+      phoneNumberIds: [...new Set(phoneNumberIds)],
+      fields: [...new Set(fields)],
+    }
+  } catch {
+    // Invalid JSON is not processed.
+    // Signature verification still takes place below.
+  }
+
+  console.log('[WEBHOOK-DIAGNOSTIC] Request received', {
+    ...diagnostic,
+    hasSignature: Boolean(signature),
+    signaturePrefix: signature?.slice(0, 20) ?? null,
+    bodyBytes: rawBody.length,
+    userAgent: request.headers.get('user-agent'),
+    contentType: request.headers.get('content-type'),
+    environment: process.env.VERCEL_ENV ?? 'unknown',
+  })
+
+  // Do not process or accept the event unless its signature is valid.
+  if (!verifyMetaWebhookSignature(rawBodyText, signature)) {
+    console.error('[WEBHOOK-DIAGNOSTIC] Signature rejected', {
+      ...diagnostic,
+      bodyBytes: rawBody.length,
+      environment: process.env.VERCEL_ENV ?? 'unknown',
+    })
+
     console.warn(
       '[webhook] rejected request with invalid signature'
     )
@@ -323,13 +433,18 @@ export async function POST(request: Request) {
   }
 
   try {
-    body = JSON.parse(rawBody)
+    body = JSON.parse(rawBodyText)
   } catch {
     return NextResponse.json(
       { error: 'Invalid JSON' },
       { status: 400 }
     )
   }
+
+  console.log('[webhook][POST] Valid Meta webhook received', {
+    entries: body.entry?.length ?? 0,
+    ...diagnostic,
+  })
 
   after(async () => {
     try {
@@ -375,6 +490,18 @@ async function processWebhook(
 
       const value = change.value
 
+      console.log('[webhook] Processing change:', {
+        field: change.field,
+        phoneNumberId:
+          value.metadata?.phone_number_id,
+        displayPhoneNumber:
+          value.metadata?.display_phone_number,
+        messages:
+          value.messages?.length ?? 0,
+        statuses:
+          value.statuses?.length ?? 0,
+      })
+
       // --------------------------------------------------------
       // Status updates
       // --------------------------------------------------------
@@ -387,16 +514,12 @@ async function processWebhook(
 
       // --------------------------------------------------------
       // Incoming messages
-      //
-      // IMPORTANT:
-      // value.contacts here is the Meta webhook sender metadata.
-      //
-      // message.contacts is the actual shared WhatsApp contact card.
       // --------------------------------------------------------
 
       if (!value.messages || !value.contacts) continue
 
-      const phoneNumberId = value.metadata.phone_number_id
+      const phoneNumberId =
+        value.metadata.phone_number_id
 
       const { data: configRows, error: configError } =
         await supabaseAdmin()
@@ -452,7 +575,8 @@ async function processWebhook(
         i < value.messages.length;
         i++
       ) {
-        const message = value.messages[i]
+        const message =
+          value.messages[i]
 
         const senderContact =
           value.contacts[i] ||
@@ -537,9 +661,6 @@ async function handleStatusUpdate(status: {
   timestamp: string
   recipient_id: string
 
-  // ============================================================
-  // Meta sends this array when a message fails.
-  // ============================================================
   errors?: Array<{
     code?: number
     title?: string
@@ -618,12 +739,6 @@ async function handleStatusUpdate(status: {
       update.read_at = tsIso
     }
 
-    // ==========================================================
-    // IMPORTANT:
-    // When Meta reports "failed", save the actual error returned
-    // by Meta instead of leaving error_message as NULL.
-    // ==========================================================
-
     if (
       status.status === 'failed'
     ) {
@@ -649,10 +764,8 @@ async function handleStatusUpdate(status: {
         {
           whatsapp_message_id:
             status.id,
-
           recipient_id:
             status.recipient_id,
-
           error:
             metaError,
         }
@@ -948,10 +1061,6 @@ async function processMessage(
   const contactName =
     contact.profile.name
 
-  // ----------------------------------------------------------
-  // Find/create contact
-  // ----------------------------------------------------------
-
   const contactOutcome =
     await findOrCreateContact(
       accountId,
@@ -966,14 +1075,6 @@ async function processMessage(
 
   const contactRecord =
     contactOutcome.contact
-
-  // ----------------------------------------------------------
-  // Find/create conversation
-  //
-  // IMPORTANT:
-  // A conversation is unique by:
-  // account + WhatsApp config + contact.
-  // ----------------------------------------------------------
 
   const convResult =
     await findOrCreateConversation(
@@ -990,10 +1091,6 @@ async function processMessage(
   const conversation =
     convResult.conversation
 
-  // ----------------------------------------------------------
-  // Conversation created webhook
-  // ----------------------------------------------------------
-
   if (convResult.created) {
     await dispatchWebhookEvent(
       supabaseAdmin(),
@@ -1008,10 +1105,6 @@ async function processMessage(
     )
   }
 
-  // ----------------------------------------------------------
-  // Reaction
-  // ----------------------------------------------------------
-
   if (message.type === 'reaction') {
     await handleReaction(
       message,
@@ -1021,10 +1114,6 @@ async function processMessage(
 
     return
   }
-
-  // ----------------------------------------------------------
-  // Parse message
-  // ----------------------------------------------------------
 
   const {
     contentText,
@@ -1039,10 +1128,6 @@ async function processMessage(
       ? { accountId }
       : null
   )
-
-  // ----------------------------------------------------------
-  // Reply context
-  // ----------------------------------------------------------
 
   let replyToInternalId:
     | string
@@ -1062,10 +1147,6 @@ async function processMessage(
       )
     }
   }
-
-  // ----------------------------------------------------------
-  // Content type
-  // ----------------------------------------------------------
 
   const ALLOWED_CONTENT_TYPES =
     new Set([
@@ -1091,10 +1172,6 @@ async function processMessage(
           ? 'interactive'
           : 'text'
 
-  // ----------------------------------------------------------
-  // First inbound message
-  // ----------------------------------------------------------
-
   const {
     count:
       priorCustomerMsgCount,
@@ -1118,10 +1195,6 @@ async function processMessage(
 
   const isFirstInboundMessage =
     (priorCustomerMsgCount ?? 0) === 0
-
-  // ----------------------------------------------------------
-  // Insert message
-  // ----------------------------------------------------------
 
   const {
     data: insertedRows,
@@ -1167,10 +1240,6 @@ async function processMessage(
         interactive_reply_id:
           interactiveReplyId,
 
-        // ----------------------------------------------------
-        // NEW:
-        // Persist the actual WhatsApp shared contact card.
-        // ----------------------------------------------------
         contact_card:
           contactCard,
       },
@@ -1193,10 +1262,6 @@ async function processMessage(
     return
   }
 
-  // ----------------------------------------------------------
-  // Idempotency
-  // ----------------------------------------------------------
-
   if (
     !insertedRows ||
     insertedRows.length === 0
@@ -1208,10 +1273,6 @@ async function processMessage(
 
     return
   }
-
-  // ----------------------------------------------------------
-  // Update conversation
-  // ----------------------------------------------------------
 
   const {
     error: convError,
@@ -1235,27 +1296,15 @@ async function processMessage(
     )
   }
 
-  // ----------------------------------------------------------
-  // Reopen closed conversation
-  // ----------------------------------------------------------
-
   await reopenClosedConversation(
     supabaseAdmin(),
     conversation
   )
 
-  // ----------------------------------------------------------
-  // Broadcast reply
-  // ----------------------------------------------------------
-
   await flagBroadcastReplyIfAny(
     accountId,
     contactRecord.id
   )
-
-  // ----------------------------------------------------------
-  // Flows
-  // ----------------------------------------------------------
 
   const flowResult =
     await dispatchInboundToFlows({
@@ -1300,10 +1349,6 @@ async function processMessage(
 
   const flowConsumed =
     flowResult.consumed
-
-  // ----------------------------------------------------------
-  // Automations
-  // ----------------------------------------------------------
 
   const inboundText =
     contentText ??
@@ -1376,10 +1421,6 @@ async function processMessage(
     )
   }
 
-  // ----------------------------------------------------------
-  // AI auto reply
-  // ----------------------------------------------------------
-
   if (
     !flowConsumed &&
     !interactiveReplyId &&
@@ -1394,10 +1435,6 @@ async function processMessage(
       configOwnerUserId,
     })
   }
-
-  // ----------------------------------------------------------
-  // Public webhook
-  // ----------------------------------------------------------
 
   await dispatchWebhookEvent(
     supabaseAdmin(),
@@ -1509,10 +1546,6 @@ async function parseMessageContent(
   }
 
   switch (message.type) {
-    // --------------------------------------------------------
-    // Text
-    // --------------------------------------------------------
-
     case 'text':
       return {
         ...empty,
@@ -1521,24 +1554,17 @@ async function parseMessageContent(
           null,
       }
 
-    // --------------------------------------------------------
-    // Image
-    // --------------------------------------------------------
-
     case 'image':
       if (message.image?.id) {
         return {
           ...empty,
-
           contentText:
             message.image.caption ||
             null,
-
           mediaUrl:
             await verifyAndBuildUrl(
               message.image.id
             ),
-
           mediaType:
             message.image.mime_type,
         }
@@ -1546,24 +1572,17 @@ async function parseMessageContent(
 
       return empty
 
-    // --------------------------------------------------------
-    // Video
-    // --------------------------------------------------------
-
     case 'video':
       if (message.video?.id) {
         return {
           ...empty,
-
           contentText:
             message.video.caption ||
             null,
-
           mediaUrl:
             await verifyAndBuildUrl(
               message.video.id
             ),
-
           mediaType:
             message.video.mime_type,
         }
@@ -1571,26 +1590,19 @@ async function parseMessageContent(
 
       return empty
 
-    // --------------------------------------------------------
-    // Document
-    // --------------------------------------------------------
-
     case 'document':
       if (message.document?.id) {
         return {
           ...empty,
-
           contentText:
             message.document.caption ||
             message.document.filename ||
             null,
-
           mediaUrl:
             await verifyAndBuildUrl(
               message.document.id,
               message.document.filename
             ),
-
           mediaType:
             message.document.mime_type,
         }
@@ -1598,20 +1610,14 @@ async function parseMessageContent(
 
       return empty
 
-    // --------------------------------------------------------
-    // Audio
-    // --------------------------------------------------------
-
     case 'audio':
       if (message.audio?.id) {
         return {
           ...empty,
-
           mediaUrl:
             await verifyAndBuildUrl(
               message.audio.id
             ),
-
           mediaType:
             message.audio.mime_type,
         }
@@ -1619,30 +1625,20 @@ async function parseMessageContent(
 
       return empty
 
-    // --------------------------------------------------------
-    // Sticker
-    // --------------------------------------------------------
-
     case 'sticker':
       if (message.sticker?.id) {
         return {
           ...empty,
-
           mediaUrl:
             await verifyAndBuildUrl(
               message.sticker.id
             ),
-
           mediaType:
             message.sticker.mime_type,
         }
       }
 
       return empty
-
-    // --------------------------------------------------------
-    // Location
-    // --------------------------------------------------------
 
     case 'location':
       if (message.location) {
@@ -1666,26 +1662,13 @@ async function parseMessageContent(
 
       return empty
 
-    // --------------------------------------------------------
-    // Reaction
-    // --------------------------------------------------------
-
     case 'reaction':
       return {
         ...empty,
-
         contentText:
           message.reaction?.emoji ||
           null,
       }
-
-    // --------------------------------------------------------
-    // WhatsApp shared contact
-    //
-    // IMPORTANT:
-    // Meta's message type is "contacts".
-    // Internally we store it as "contact".
-    // --------------------------------------------------------
 
     case 'contacts': {
       const contacts =
@@ -1696,7 +1679,6 @@ async function parseMessageContent(
       ) {
         return {
           ...empty,
-
           contentText:
             '[Contato compartilhado]',
         }
@@ -1755,22 +1737,16 @@ async function parseMessageContent(
 
       return {
         ...empty,
-
         contentText:
           lines.length > 0
             ? lines.join('\n')
             : '[Contato compartilhado]',
-
         contactCard:
           contacts.length === 1
             ? contacts[0]
             : contacts,
       }
     }
-
-    // --------------------------------------------------------
-    // Interactive
-    // --------------------------------------------------------
 
     case 'interactive': {
       const reply =
@@ -1782,11 +1758,9 @@ async function parseMessageContent(
       if (reply?.id) {
         return {
           ...empty,
-
           contentText:
             reply.title ||
             reply.id,
-
           interactiveReplyId:
             reply.id,
         }
@@ -1794,15 +1768,10 @@ async function parseMessageContent(
 
       return {
         ...empty,
-
         contentText:
           '[Interactive reply]',
       }
     }
-
-    // --------------------------------------------------------
-    // Template quick reply
-    // --------------------------------------------------------
 
     case 'button': {
       const payload =
@@ -1817,25 +1786,18 @@ async function parseMessageContent(
 
       return {
         ...empty,
-
         contentText:
           label ||
           payload,
-
         interactiveReplyId:
           payload ||
           label,
       }
     }
 
-    // --------------------------------------------------------
-    // Unknown
-    // --------------------------------------------------------
-
     default:
       return {
         ...empty,
-
         contentText:
           `[Unsupported message type: ${message.type}]`,
       }

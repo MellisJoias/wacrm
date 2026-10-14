@@ -82,6 +82,9 @@ export function WhatsAppConfig() {
   const [statusMessage, setStatusMessage] =
     useState<string>('');
 
+  const [qualityRating, setQualityRating] =
+    useState<string | null>(null);
+
   const loadedAccountIdRef =
     useRef<string | null>(null);
 
@@ -98,6 +101,27 @@ export function WhatsAppConfig() {
   const isRegistered = Boolean(config?.registered_at);
   const lastRegistrationError =
     config?.last_registration_error ?? null;
+
+  const normalizedQualityRating =
+    (qualityRating ?? '').toUpperCase();
+
+  const qualityRatingLabel =
+    ['GREEN', 'HIGH'].includes(normalizedQualityRating)
+      ? 'Alta'
+      : ['YELLOW', 'MEDIUM'].includes(normalizedQualityRating)
+        ? 'Média'
+        : ['RED', 'LOW'].includes(normalizedQualityRating)
+          ? 'Baixa'
+          : 'Indisponível';
+
+  const qualityRatingClass =
+    ['GREEN', 'HIGH'].includes(normalizedQualityRating)
+      ? 'text-emerald-400'
+      : ['YELLOW', 'MEDIUM'].includes(normalizedQualityRating)
+        ? 'text-amber-400'
+        : ['RED', 'LOW'].includes(normalizedQualityRating)
+          ? 'text-red-400'
+          : 'text-muted-foreground';
 
   const [verifyingRegistration, setVerifyingRegistration] =
     useState(false);
@@ -132,6 +156,7 @@ export function WhatsAppConfig() {
     setConnectionStatus('disconnected');
     setResetReason(null);
     setStatusMessage('');
+    setQualityRating(null);
   }
 
   function hydrateConfig(
@@ -157,6 +182,7 @@ export function WhatsAppConfig() {
     setRegistrationProbe(null);
     setResetReason(null);
     setStatusMessage('');
+    setQualityRating(null);
   }
 
   const verifySelectedConfig = useCallback(
@@ -172,6 +198,12 @@ export function WhatsAppConfig() {
         );
 
         const payload = await res.json();
+
+        setQualityRating(
+          payload.connected
+            ? payload.phone_info?.quality_rating ?? null
+            : null,
+        );
 
         if (payload.connected) {
           setConnectionStatus('connected');
@@ -574,6 +606,12 @@ export function WhatsAppConfig() {
 
       const payload = await res.json();
 
+      setQualityRating(
+        payload.connected
+          ? payload.phone_info?.quality_rating ?? null
+          : null,
+      );
+
       if (payload.connected) {
         setConnectionStatus('connected');
         setResetReason(null);
@@ -972,6 +1010,39 @@ export function WhatsAppConfig() {
                         'notConnectedDesc',
                       )}
                 </AlertDescription>
+              </Alert>
+
+              <Alert className="bg-card border-border">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <AlertTitle className="text-foreground mb-1">
+                      Qualidade do número
+                    </AlertTitle>
+
+                    <AlertDescription className="text-muted-foreground text-sm">
+                      Classificação informada pela Meta
+                    </AlertDescription>
+
+                    <p className={`mt-2 text-sm font-semibold ${qualityRatingClass}`}>
+                      {qualityRatingLabel}
+                    </p>
+                  </div>
+
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleTestConnection}
+                    disabled={testing}
+                    className="shrink-0"
+                  >
+                    {testing ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <RotateCcw className="size-3.5" />
+                    )}
+                    Atualizar
+                  </Button>
+                </div>
               </Alert>
 
               <Alert
